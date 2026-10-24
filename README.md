@@ -4,6 +4,8 @@ An [Omarchy](https://omarchy.org) shell bar widget that shows the load on your A
 adapter, in watts, as reported by the [power-watch](https://github.com/rsd/power-watch)
 service. Plugin id `io.github.rsd.power-watch`.
 
+![Power Watch panel: 1h chart with average, max, CPU and GPU lines, threshold, and the live breakdown](preview.png)
+
 - **Bar.** The load in watts, colored as normal, approaching (from 85 % of the
   threshold) or over. A total that is only a lower bound (some terms unknown,
   counted as 0 W) is marked with "≥". Measured platform power and a suspended
