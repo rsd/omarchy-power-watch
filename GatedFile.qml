@@ -9,7 +9,12 @@ import "Model.js" as Model
 // string (measured: a 200 MB current.json held 0.8-1.7 GB per bar and
 // OOM-killed two bars at a 3 GB cap). The listing is a FolderListModel — a
 // readdir + stat on Qt's worker thread, no process — and FileView only ever
-// gets a path the listing has passed (Model.gateDecision).
+// gets a path the listing has passed (Model.gateDecision): the listed entry's
+// own filePath, so the file read is the file whose size was checked. Building
+// it again from `dir` + `name` let the two differ (a relative dir listed
+// /tmp/x through file://tmp/x and opened $CWD/tmp/x; a ".." after a symlink
+// was cleaned lexically by one and resolved by the other); Model.stateDir
+// also refuses such a dir before it gets here.
 //
 // What the listing does (measured under a scratch qs): it follows an atomic
 // rename (os.replace) with the new size, leaves FIFOs out (so a FIFO reads as
@@ -33,6 +38,15 @@ import "Model.js" as Model
 // A version (size + mtime) already handed to the reader is not read again,
 // and with `minIntervalMs` a read due inside the window waits for its end,
 // then re-lists so it reads the latest size: at most one read per window.
+// textRead hands the owner that version and the name of the file read with
+// the text, so it can tell a file it has parsed before (BarWidget's per-range
+// history cache) and a read of the file it was just renamed away from: a new
+// `name` restarts the gate only a turn later, and a load of the old file can
+// land in between (Model.historyReadRange).
+//
+// A listing that drops a file read fine just before is re-listed once before
+// "missing" is reported (Model.recheckMissing): under sub-millisecond atomic
+// renames a listing can omit the file for a moment.
 //
 // Residual: a file that grows between the listing and FileView's open is read
 // whole (TOCTOU), and so is one whose size the listing gets wrong without
@@ -55,10 +69,10 @@ Item {
   property bool waiting: false
   property bool resetting: false
   property bool ready: false
+  // The one re-list after a "missing" that followed a good read was made.
+  property bool rechecked: false
 
-  readonly property string filePath: gate.dir + "/" + gate.name
-
-  signal textRead(string content)
+  signal textRead(string content, string version, string fileName)
   signal failed(string outcome)
 
   function relist() {
@@ -90,7 +104,8 @@ Item {
       return {
         size: listing.get(i, "fileSize"),
         modified: modified ? modified.getTime() : null,
-        isDir: listing.get(i, "fileIsDir")
+        isDir: listing.get(i, "fileIsDir"),
+        path: listing.get(i, "filePath")
       }
     }
     return null
@@ -103,6 +118,12 @@ Item {
 
   function settle() {
     var decision = Model.gateDecision(gate.entry(), gate.maxBytes, gate.version)
+    if (Model.recheckMissing(decision.action, gate.outcome, gate.rechecked)) {
+      gate.rechecked = true
+      Qt.callLater(gate.relist)
+      return
+    }
+    if (decision.action !== "missing") gate.rechecked = false
     if (decision.action === "none") return
     if (decision.action === "read") {
       if (throttle.running) {
@@ -110,8 +131,8 @@ Item {
         return
       }
       gate.version = decision.version
-      if (file.path === gate.filePath) file.reload()
-      else file.path = gate.filePath
+      if (file.path === decision.path) file.reload()
+      else file.path = decision.path
       if (gate.minIntervalMs > 0) throttle.restart()
       return
     }
@@ -127,6 +148,7 @@ Item {
   function restart() {
     throttle.stop()
     gate.waiting = false
+    gate.rechecked = false
     gate.version = ""
     gate.outcome = "pending"
     file.path = ""
@@ -181,7 +203,7 @@ Item {
     onFileChanged: gate.poke()
     onLoaded: {
       gate.outcome = "ok"
-      gate.textRead(file.text())
+      gate.textRead(file.text(), gate.version, Model.baseName(file.path))
     }
     onLoadFailed: function(error) {
       if (file.path === "") return

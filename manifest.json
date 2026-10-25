@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.rsd.power-watch",
   "name": "Power Watch",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "author": "Raul Dias",
   "license": "MIT",
   "description": "Estimated or measured AC adapter load from the power-watch service, colored against its threshold, with 1h/24h/7d history.",

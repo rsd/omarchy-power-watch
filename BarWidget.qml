@@ -43,7 +43,16 @@ import "Model.js" as Model
 //     once a minute or less and a full tier takes ~0.3 s to parse), which also
 //     bounds chart repaints. Opening the panel (a new GatedFile) and switching
 //     the range (a new file name, whose restart stops the throttle) both read
-//     at once; the new range's interval applies from that read on.
+//     at once; the new range's interval applies from that read on. A range
+//     switched back to is not parsed again while its file is the version
+//     parsed last (size + mtime, from the gate) and that parse is younger than
+//     the range's refreshMs (Model.historyCacheHit): what the throttle would
+//     have kept on screen. One cached parse per range, dropped on close.
+//
+// A state directory that is not an absolute path without "." or ".." parts is
+// refused (Model.stateDir is ""; nothing is listed or read) and the reason is
+// shown where "service not running" would be (Model.stateDirProblem); the
+// chart only says it is refused (Model.STATE_DIR_CHART_TEXT).
 //
 // Parse caps sit behind the read caps: current.json is not parsed past
 // Model.CURRENT_MAX_CHARS, and a history tier is parsed from its end, at most
@@ -60,6 +69,9 @@ Panel {
   // ------------------------------------------------------------- data state
 
   readonly property string stateDir: Model.stateDir(Quickshell.env("POWER_WATCH_STATE_DIR"),
+    Quickshell.env("XDG_STATE_HOME"), Quickshell.env("HOME"))
+  // Non-empty exactly when stateDir is "": why nothing is read.
+  readonly property string stateDirProblem: Model.stateDirProblem(Quickshell.env("POWER_WATCH_STATE_DIR"),
     Quickshell.env("XDG_STATE_HOME"), Quickshell.env("HOME"))
 
   property var current: null
@@ -82,6 +94,9 @@ Panel {
   // `at` is when it was read: the chart's right edge. 0 = nothing loaded.
   readonly property var noHistory: ({ points: [], skipped: 0, truncated: false, error: "", at: 0 })
   property var history: root.noHistory
+  // The last parse per range key, { version, history }, while the panel is
+  // open (see the header comment); emptied on close.
+  property var historyCache: ({})
   readonly property string historyError: root.history.error
   readonly property int historySkipped: root.history.skipped
 
@@ -163,10 +178,21 @@ Panel {
     root.currentError = outcome
   }
 
-  function applyHistory(text) {
+  // `fileName` is the tier the text came from: a late read of the tier the
+  // range just left is dropped, never shown or cached as this range's.
+  function applyHistory(text, version, fileName) {
+    var key = Model.historyReadRange(fileName, root.range)
+    if (key === "") return
     var at = Date.now() / 1000
+    var cached = root.historyCache[key]
+    if (Model.historyCacheHit(cached, version, at, Model.rangeFor(key).refreshMs)) {
+      root.history = cached.history
+      return
+    }
     var parsed = Model.parseHistory(text, at)
-    root.history = { points: parsed.points, skipped: parsed.skipped, truncated: parsed.truncated, error: "", at: at }
+    var history = { points: parsed.points, skipped: parsed.skipped, truncated: parsed.truncated, error: "", at: at }
+    root.historyCache[key] = { version: version, history: history }
+    root.history = history
   }
 
   // No file yet is an empty history, not an error: the service writes the
@@ -176,6 +202,7 @@ Panel {
     var error = outcome === "too large"
       ? "History file too large to read (over " + Math.round(Model.HISTORY_MAX_BYTES / 1048576) + " MiB); not read."
       : outcome === "unreadable" ? "History file unreadable." : ""
+    delete root.historyCache[root.range]
     root.history = { points: [], skipped: 0, truncated: false, error: error, at: Date.now() / 1000 }
   }
 
@@ -195,8 +222,10 @@ Panel {
 
   onOpenedChanged: {
     if (root.opened) return
-    // Closing drops the history text (the Loader) and the parsed points.
+    // Closing drops the history text (the Loader) and the parsed points,
+    // cached ones included.
     root.history = root.noHistory
+    root.historyCache = ({})
   }
 
   implicitWidth: button.implicitWidth
@@ -245,7 +274,7 @@ Panel {
         maxBytes: Model.HISTORY_MAX_BYTES
         watchContent: true
         minIntervalMs: Model.rangeFor(root.range).refreshMs
-        onTextRead: function(content) { root.applyHistory(content) }
+        onTextRead: function(content, version, fileName) { root.applyHistory(content, version, fileName) }
         onFailed: function(outcome) { root.applyHistoryFailure(outcome) }
       }
     }
@@ -276,7 +305,7 @@ Panel {
     fixedHeight: root.vertical ? Model.BAR_VERTICAL_SLOTS * Style.bar.iconSlot : -1
     foreground: root.levelColor(root.barColor)
     dimmed: root.stale
-    tooltipText: Model.tooltipText(root.current, root.stale, root.currentError)
+    tooltipText: Model.tooltipText(root.current, root.stale, root.currentError, root.stateDirProblem)
     onPressed: function(b) { root.toggle() }
 
     // Without the mark, its slot stays empty above the number, so the digits
@@ -377,7 +406,7 @@ Panel {
                 width: parent.width
                 wrapMode: Text.Wrap
                 text: root.stale
-                  ? Model.staleMessage(root.current, root.currentError)
+                  ? Model.staleMessage(root.current, root.currentError, root.stateDirProblem)
                   : Model.statusLine(root.current).toUpperCase()
                 color: root.stale ? root.urgent : root.levelColor(root.foreground)
                 opacity: root.stale || root.level !== "normal" ? 1 : 0.7
@@ -389,7 +418,7 @@ Panel {
 
               Text {
                 textFormat: Text.PlainText
-                visible: root.stale
+                visible: root.stale && root.stateDirProblem === ""
                 width: parent.width
                 wrapMode: Text.WrapAnywhere
                 text: Model.SERVICE_HINT
@@ -437,7 +466,8 @@ Panel {
             labelBackground: Commons.Color.popups.background
             fontFamily: root.fontFamily
             fontSize: Style.font.caption
-            emptyText: root.historyError !== "" ? root.historyError
+            emptyText: root.stateDirProblem !== "" ? Model.STATE_DIR_CHART_TEXT
+              : root.historyError !== "" ? root.historyError
               : root.history.at > 0 ? "No history for this range yet" : "Loading history"
           }
 

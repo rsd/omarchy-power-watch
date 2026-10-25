@@ -41,8 +41,11 @@ service. Plugin id `io.github.rsd.power-watch`.
 
 ## Requirements
 
-The widget only displays what the **power-watch** service writes, so the service
-has to be installed and running: <https://github.com/rsd/power-watch>.
+The **power-watch** service must be installed and running: the widget only
+displays what it writes and shows nothing without it
+(<https://github.com/rsd/power-watch>). The host is the Omarchy shell
+(Quickshell) with its `omarchy` CLI; the plugin has no other dependency. What
+the service itself needs is in its README.
 
 From a power-watch checkout:
 
@@ -94,10 +97,11 @@ from `Model.js`.
 **State directory**, as the shell process sees it: `$POWER_WATCH_STATE_DIR` if
 set and non-empty, else `$XDG_STATE_HOME/power-watch`, else
 `~/.local/state/power-watch`. If you set the variable for the service, set it
-for the shell too (or for neither). The variable must be an **absolute path**:
-a relative one resolves differently for the size check (which lists the
-directory) and for the read, so the check would gate a different file than the
-one read.
+for the shell too (or for neither). A state directory that is not an
+absolute path, or has a `.` or `..` segment, is **refused**: nothing is listed or
+read, and the widget says so (see "Without the service"). The service does
+accept such a path, so reading `~/.local/state` instead would read a different
+directory than the one it writes. An unset `HOME` is refused the same way.
 
 **`current.json`**: one JSON object, rewritten atomically after each sample.
 Read when its size or mtime changes, at most once a second per bar, and never
@@ -130,11 +134,16 @@ dash, never as 0.
 (7d): JSON Lines, read only while the panel is open, never when larger than
 16 MiB, and at most every 5 s for 1h and once a minute for 24h and 7d (those
 tiers change once a minute or less). Opening the panel or switching the range
-reads at once. A line is an object with `t` (bucket start, Unix
+reads at once; a tier parsed less than one refresh interval ago, with the same
+size and mtime as the file now has, is not parsed again (the file is still read
+on each switch), and the cache is dropped when the panel closes. A read that
+arrives for a range other than the current one is dropped. A line is an object with `t` (bucket start, Unix
 seconds), `n` (samples), `avg` and `max` (total, W), `cpu`, `gpu`, `rest`, `chg`
 (W), `ac` (fraction of samples on AC, 0–1) and `k` (`m` measured, `e`
 estimated, `x` mixed). Points more than 2.5 steps apart are drawn as a gap, never
-interpolated. At most the newest 4 MiB / 40 000 lines are parsed.
+interpolated. At most the newest 4 MiB / 40 000 lines are parsed. A line
+longer than 256 characters (the service's are about 110-134) or not starting
+with `{` is skipped and counted without being parsed.
 
 ## Without the service
 
@@ -142,19 +151,22 @@ Everything degrades to a stated reason; nothing throws or shows `NaN`.
 
 | Situation | Bar | Panel |
 |---|---|---|
-| `current.json` missing or empty | `-- W`, dimmed | "The power-watch service is not running (no current.json)." and the start command |
+| State directory refused (relative, `.`/`..` segment, `HOME` unset) | `-- W`, dimmed; tooltip gives the reason | the reason in the status line (names the variable and quotes its value); chart says "State directory refused"; no start hint |
+| `current.json` missing or empty | `-- W`, dimmed (after one immediate re-list if it was good a moment ago, so a rapid rename does not flash it) | "The power-watch service is not running (no current.json)." and the start command |
 | Sample older than 3 intervals | `-- W`, dimmed | "... (last sample is old)." breakdown dimmed and titled as the last sample |
 | `current.json` over 16 KiB | keeps the last good sample until it goes stale | once stale: "current.json is too large to read ... not read." |
 | `current.json` not valid JSON / not an object | same | once stale: "current.json is unreadable." |
 | History file missing | no effect | "No history for this range yet" |
 | History file over 16 MiB / unreadable | no effect | "History file too large to read ... not read." / "History file unreadable." |
-| Torn or garbage history lines | no effect | skipped and counted ("N unreadable history lines skipped.") |
+| Torn, garbage or over-long (> 256 characters) history lines | no effect | skipped and counted ("N unreadable history lines skipped.") |
 
 ## What it never does
 
 It makes no network access, writes no files, and starts no processes: the
-sources contain no `Process`, no `execDetached`, no `XMLHttpRequest`, and the
-only files opened are the four above, read through a size gate (a directory
+sources contain no `Process`, no `execDetached`, no `XMLHttpRequest`, no
+`WebSocket`, no `Socket`, no `Qt.openUrlExternally`, no network module import and
+no remote URL; `tests/model-test.js` checks this on every `.qml` and `.js`
+file. The only files opened are the four above, read through a size gate (a directory
 listing says how big a file is before it is read). The start command shown when
 the service is not running (`systemctl --user enable --now power-watch.service`)
 is display text; nothing executes it. It does not read the power-watch
@@ -170,9 +182,11 @@ that settles a state directory that does not exist.
   and the start command shown in the panel when the sample is stale, are display
   text only. Nothing in the plugin runs them.
 - The plugin spawns no processes and has no network access (no `Process`,
-  `execDetached` or `XMLHttpRequest`).
+  `execDetached`, `XMLHttpRequest`, `WebSocket` or `Socket`); a source test
+  enforces it.
 - Files are read with `FileView` behind a size gate taken from a directory
-  listing. That cap is advisory, as documented in `GatedFile.qml`: symlinks are
+  listing of the same file that is then read (a refused state directory is never
+  listed). That cap is advisory, as documented in `GatedFile.qml`: symlinks are
   followed, there is no limit while reading, and a file that grows between the
   listing and the read is not caught. The writer is the user's own service in
   the user's own state directory.
@@ -223,7 +237,12 @@ Needs `node` and the `omarchy` CLI. Suites:
   linter, the shell sources or node are missing.
 - A lint self-test: injects an unknown type into copies of `BarWidget.qml` and
   `Chart.qml` and requires the lint check to fail for each.
-- `tests/model-test.js`: the model under node. One test compares the state
+- A scratch Quickshell load of `BarWidget.qml`, with a self-test, and a scratch
+  Quickshell run ("read gate reads the listed file") that checks the gate reads
+  the file it judged. Both are reported as skipped without `qs`, a Wayland session or the shell sources.
+- `tests/model-test.js`: the model under node (92 cases), including the
+  no-network source check, state directory refusal, history line limits and the
+  parse cache. One test compares the state
   directory with the service's own `state_dir()`; it finds the service through
   `POWER_WATCH_BIN` or `power-watch` on `PATH` and otherwise prints a `skip`
   line, which is left out of the "N/N passed" count. A `POWER_WATCH_BIN` that

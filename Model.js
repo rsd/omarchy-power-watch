@@ -98,11 +98,14 @@ var HISTORY_MAX_BYTES = 16777216
 // the gate already implies it). A history tier is parsed from its END: the
 // newest HISTORY_PARSE_CHARS and at most HISTORY_MAX_LINES lines, so a fast
 // interval shows the latest part of the range ("older points not shown")
-// instead of nothing.
+// instead of nothing. A service line is ~110 characters (the longest measured
+// on a live install: 134, in all three tiers); a line over
+// HISTORY_MAX_LINE_CHARS, or one that does not start with "{", is skipped
+// without being parsed (parseHistory).
 var CURRENT_MAX_CHARS = 16384
 var HISTORY_PARSE_CHARS = 4194304
 var HISTORY_MAX_LINES = 40000
-var HISTORY_MAX_LINE_CHARS = 1024
+var HISTORY_MAX_LINE_CHARS = 256
 
 // The chart never draws more than this many points per series across the
 // whole range, whatever the gaps: past it, points are merged into this many
@@ -208,15 +211,89 @@ function stripTrailingSlashes(path) {
   return out === "" && path !== "" ? "/" : out
 }
 
+// The first / last n UTF-16 units of s, one fewer when the cut would split
+// a surrogate pair (an emoji in a path), so no lone half is ever shown.
+function headChars(s, n) {
+  if (s.length <= n) return s
+  var c = s.charCodeAt(n - 1)
+  return s.substring(0, c >= 0xd800 && c <= 0xdbff ? n - 1 : n)
+}
+
+function tailChars(s, n) {
+  if (s.length <= n) return s
+  var start = s.length - n
+  var c = s.charCodeAt(start)
+  return s.substring(c >= 0xdc00 && c <= 0xdfff ? start + 1 : start)
+}
+
+// A refused state dir's value is shown up to twice this many characters;
+// past that, its first and last this many around an ellipsis, so the
+// tooltip line that quotes it stays under 80 characters.
+var STATE_DIR_SHOWN_CHARS = 36
+
+// What the chart says for a refused state dir: one unwrapped canvas line in
+// the panel, so a short label; the reason itself is in the status line and
+// the tooltip.
+var STATE_DIR_CHART_TEXT = "State directory refused"
+
+// An absolute path with no "." or ".." segment. Anything else is not read:
+// the read gate stats the file through a file:// URL, which turns a relative
+// path into a host name (file://tmp/x lists /tmp/x) and cleans ".." lexically
+// (/a/link/../b lists /a/b), while the kernel opens the path relative to the
+// shell's working directory and resolves ".." after the symlink — so the file
+// whose size was checked would not be the file read (measured: a 1 MiB
+// current.json read through the 16 KiB gate both ways).
+function isCanonicalDir(path) {
+  if (typeof path !== "string" || path.charAt(0) !== "/") return false
+  var parts = path.split("/")
+  for (var i = 0; i < parts.length; i++) if (parts[i] === "." || parts[i] === "..") return false
+  return true
+}
+
 // Mirrors state_dir() in the power-watch service (bin/power-watch):
 // $POWER_WATCH_STATE_DIR when set and non-empty, else $XDG_STATE_HOME (or
 // ~/.local/state) + /power-watch. No trimming, as in Python; trailing slashes
-// go, as pathlib drops them.
+// go, as pathlib drops them. Returns { dir, problem }: dir "" with the reason
+// in `problem` when the path would not be canonical (isCanonicalDir). The
+// service accepts such a path (pathlib resolves it against its own working
+// directory), so it is refused here rather than replaced by another
+// directory: the plugin never reads a different place than the service writes
+// without saying so. `problem` is broken into lines for the tooltip, which
+// does not wrap; staleMessage joins them for the status line, which does.
+function resolveStateDir(envDir, xdgStateHome, home) {
+  var name, value, dir
+  if (typeof envDir === "string" && envDir !== "") {
+    name = "POWER_WATCH_STATE_DIR"
+    value = envDir
+    dir = stripTrailingSlashes(envDir)
+  } else {
+    var useXdg = typeof xdgStateHome === "string" && xdgStateHome !== ""
+    name = useXdg ? "XDG_STATE_HOME" : "HOME"
+    value = useXdg ? xdgStateHome : String(home || "")
+    var base = useXdg ? stripTrailingSlashes(xdgStateHome) : stripTrailingSlashes(value) + "/.local/state"
+    dir = (base === "/" ? "" : base) + "/power-watch"
+    if (!useXdg && value === "") return { dir: "", problem: "HOME is not set, so the state directory is unknown; not read." }
+  }
+  if (isCanonicalDir(dir)) return { dir: dir, problem: "" }
+  // Not safeLabel: it trims, and a leading space may be the very mistake. A
+  // long value keeps its start and its end, where a ".." usually is. The
+  // control characters go, "\n" with them, so the message's own line breaks
+  // are the only ones (staleMessage joins them).
+  var shown = value.length > 4096 ? headChars(value, 2048) + tailChars(value, 2048) : value
+  shown = shown.replace(UNSAFE_LABEL_CHARS, "")
+  if (shown.length > STATE_DIR_SHOWN_CHARS * 2 + 1)
+    shown = headChars(shown, STATE_DIR_SHOWN_CHARS) + "\u2026" + tailChars(shown, STATE_DIR_SHOWN_CHARS)
+  return { dir: "", problem: name + " is\n\"" + shown + "\",\nnot an absolute path without \".\" or \"..\" parts; not read." }
+}
+
+// The state directory to read, or "" when it is refused (see stateDirProblem).
 function stateDir(envDir, xdgStateHome, home) {
-  if (typeof envDir === "string" && envDir !== "") return stripTrailingSlashes(envDir)
-  var base = typeof xdgStateHome === "string" && xdgStateHome !== ""
-    ? stripTrailingSlashes(xdgStateHome) : stripTrailingSlashes(String(home || "")) + "/.local/state"
-  return (base === "/" ? "" : base) + "/power-watch"
+  return resolveStateDir(envDir, xdgStateHome, home).dir
+}
+
+// Why stateDir is "" for this environment, in words; "" when it is fine.
+function stateDirProblem(envDir, xdgStateHome, home) {
+  return resolveStateDir(envDir, xdgStateHome, home).problem
 }
 
 // A file:// URL for a local directory, every segment percent-encoded so a
@@ -325,10 +402,12 @@ function shouldRelist(outcome) {
   return outcome === "missing"
 }
 
-// The read gate, from one directory-listing entry ({ size, modified, isDir }
-// or null). Returns { action } — "missing", "unreadable", "too large",
+// The read gate, from one directory-listing entry ({ size, modified, isDir,
+// path } or null). Returns { action } — "missing", "unreadable", "too large",
 // "none" (this exact version was already handed to the reader) or "read",
-// with the version string to remember.
+// with the version string to remember and the path to read: the entry's own,
+// the one the listing stat'ed, never one rebuilt from the directory and name.
+// An entry without an absolute path is not read.
 // A size of 0 is never read: an empty file has nothing to read, and a file
 // whose size the kernel does not know — /proc (kallsyms, self/pagemap) lists
 // as 0 bytes and reads as megabytes to gigabytes — would pass any cap and be
@@ -343,7 +422,18 @@ function gateDecision(entry, maxBytes, lastVersion) {
   if (!(maxBytes > 0) || size > maxBytes) return { action: "too large" }
   var version = size + ":" + (typeof entry.modified === "number" && isFinite(entry.modified) ? entry.modified : "")
   if (version === lastVersion) return { action: "none" }
-  return { action: "read", version: version }
+  if (typeof entry.path !== "string" || entry.path.charAt(0) !== "/") return { action: "unreadable" }
+  return { action: "read", version: version, path: entry.path }
+}
+
+// Whether a listing that says "missing" is checked once more before it is
+// believed: only when the file was read fine just before, and only once in a
+// row. Under sub-millisecond atomic renames a listing can omit the file for a
+// moment (measured: 2 of ~40 flips on tmpfs), which would otherwise clear the
+// sample and show "-- W" until the next read. A file really gone is reported
+// after that one re-list.
+function recheckMissing(action, outcome, rechecked) {
+  return action === "missing" && outcome === "ok" && rechecked !== true
 }
 
 // A FileView loadFailed: no such file is "missing", anything else (permission
@@ -485,8 +575,12 @@ function totalRowValue(current) {
 var SERVICE_HINT = "systemctl --user enable --now power-watch.service"
 
 // Why there is no fresh number. `error` is the read outcome: a file that
-// exists but cannot be read is said apart from no file at all.
-function staleMessage(current, error) {
+// exists but cannot be read is said apart from no file at all. A refused state
+// directory (`dirProblem`, from stateDirProblem) comes first: nothing is read
+// then, and the service is not the thing to fix. Its tooltip line breaks are
+// joined into one paragraph here, for the status line that wraps.
+function staleMessage(current, error, dirProblem) {
+  if (typeof dirProblem === "string" && dirProblem !== "") return dirProblem.replace(/\n/g, " ")
   if (error === "too large")
     return "current.json is too large to read (over " + Math.round(CURRENT_MAX_BYTES / 1024) + " KiB); not read."
   if (error === "unreadable") return "current.json is unreadable."
@@ -494,7 +588,9 @@ function staleMessage(current, error) {
     : "The power-watch service is not running (no current.json)."
 }
 
-function tooltipText(current, stale, error) {
+// The bar tooltip never wraps: every message comes broken into short lines.
+function tooltipText(current, stale, error, dirProblem) {
+  if (typeof dirProblem === "string" && dirProblem !== "") return dirProblem
   if (stale || !current) return staleMessage(current, error) + "\nStart it: " + SERVICE_HINT
   var lines = []
   var total = boundText(current, current.totalW, formatWatts(current.totalW))
@@ -669,9 +765,14 @@ function normalizePoint(obj) {
 // points; `truncated` says one applied. The backward line count is bounded by
 // the line cap, the forward parse by the character budget.
 // Tolerant: blank lines are ignored; torn or garbage lines and lines whose t
-// does not advance are skipped and counted. Points stamped after `nowEpoch`
-// (a clock that went backwards) are ignored, uncounted, and do not hold back
-// the points after them.
+// does not advance are skipped and counted. A line is handed to JSON.parse
+// only if it starts with "{" and is at most HISTORY_MAX_LINE_CHARS long, as a
+// service line always is: a tier of bracket junk (which parsed at 1.6x the
+// cost of a valid tier, measured) is skipped at the cost of a character test.
+// Junk that starts with "{" and nests inside 256 characters still parses at
+// about that cost. Points stamped after `nowEpoch` (a clock that went
+// backwards) are ignored, uncounted, and do not hold back the points after
+// them.
 function parseHistory(text, nowEpoch) {
   var raw = typeof text === "string" ? text : ""
   var start = 0
@@ -705,7 +806,7 @@ function parseHistory(text, nowEpoch) {
     var line = raw.substring(start, end)
     start = end + 1
     if (line.trim() === "") continue
-    if (line.length > HISTORY_MAX_LINE_CHARS) { skipped++; continue }
+    if (line.length > HISTORY_MAX_LINE_CHARS || line.charCodeAt(0) !== 123) { skipped++; continue }
     var obj = null
     try { obj = JSON.parse(line) } catch (e) { obj = null }
     var point = normalizePoint(obj)
@@ -715,6 +816,37 @@ function parseHistory(text, nowEpoch) {
     points.push(point)
   }
   return { points: points, skipped: skipped, truncated: truncated }
+}
+
+// The panel keeps the last parse of each range (BarWidget's historyCache:
+// { version, history }), so switching back to a range does not parse its tier
+// again. A cached parse is reused only for the exact file version the read
+// gate has just handed over (size + mtime) and only while it is younger than
+// the range's refreshMs — the same parse the read throttle would have kept on
+// screen, with the same right edge (`history.at`), so the time window never
+// drifts further than the throttle lets it.
+function historyCacheHit(entry, version, nowEpoch, refreshMs) {
+  if (!entry || !entry.history || typeof version !== "string" || version === "") return false
+  if (entry.version !== version) return false
+  var age = nowEpoch - entry.history.at
+  return typeof age === "number" && isFinite(age) && age >= 0 && age * 1000 < refreshMs
+}
+
+// The last segment of a path or file:// URL: the file a gate's FileView read.
+function baseName(path) {
+  var p = typeof path === "string" ? path : ""
+  return p.substring(p.lastIndexOf("/") + 1)
+}
+
+// The range a history read belongs to, from the file it came from (the
+// gate's textRead names it): `rangeKey` when that file is the range's own
+// tier, "" when it is not, and the read is then neither shown nor cached. A
+// range switch renames the gate's file and restarts it a turn later
+// (Qt.callLater), so a read of the old tier can land after the range moved;
+// keyed by the range alone it would be shown, and cached, as the new one's.
+function historyReadRange(fileName, rangeKey) {
+  var range = rangeFor(rangeKey)
+  return range.key === rangeKey && fileName === range.file ? rangeKey : ""
 }
 
 function filterRange(points, fromEpoch, toEpoch) {

@@ -291,11 +291,134 @@ qml_load_selftest() {
   return $ok
 }
 
+# The read gate must read the very file its listing stat'ed, or its byte cap
+# guards another file. Two state dirs whose listed and opened files differ (the
+# audit's inputs): "<T>/link/../b", which the listing cleans to <T>/b (39 B)
+# and the kernel resolves after the symlink to <T>/deep/b (1 MiB); and the
+# relative "<T without its leading slash>/b", which the listing turns into
+# file://tmp/... = <T>/b while the kernel opens it under the working
+# directory, where a 1 MiB copy waits. Model.stateDir refuses both before a gate
+# sees them; this checks the gate on its own, plus a plain absolute dir.
+# Fatal: any read other than the 39-byte file, or a gate that never reports.
+# An interrupt (INT or TERM) stops the qs this function started, by its PID,
+# and removes the scratch directory before the script exits.
+#
+# gate_reads_listed [dir] uses GatedFile.qml from dir (default: the plugin).
+gate_reads_listed() {
+  local dir=${1:-$PLUGIN_DIR}
+  if ! have_qs_load; then
+    skip_qs_load
+    return $SKIP
+  fi
+
+  local t cfg pid="" i ok=0 small rel n
+  t=$(mktemp -d) || return 1
+  # A background job of a non-interactive shell ignores SIGINT, so on ^C the
+  # scratch qs would outlive the script without this.
+  trap 'echo "interrupted: stopping the scratch qs${pid:+ (PID $pid)}"
+    if [[ -n $pid ]] && kill "$pid" 2>/dev/null; then
+      sleep 0.5
+      kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null
+      wait "$pid" 2>/dev/null
+    fi
+    rm -rf "$t"
+    exit 130' INT TERM
+  cfg=$t/cfg
+  rel=${t#/}
+  small='{"epoch":1,"interval_s":2,"total_w":42}'
+  mkdir -p "$cfg" "$t/b" "$t/deep/a" "$t/deep/b" "$t/cwd/$rel/b"
+  printf '%s' "$small" >"$t/b/current.json"
+  head -c 1048576 /dev/zero | tr '\0' x >"$t/deep/b/current.json"
+  cp "$t/deep/b/current.json" "$t/cwd/$rel/b/current.json"
+  ln -s "$t/deep/a" "$t/link"
+  # The fixture must discriminate: the paths rebuilt from dir + name open the
+  # big files.
+  if ! (cd "$t/cwd" && (($(stat -Lc %s "$rel/b/current.json") > 16384 &&
+    $(stat -Lc %s "$t/link/../b/current.json") > 16384))); then
+    echo "FAIL the fixture does not put a big file behind the rebuilt paths"
+    trap - INT TERM
+    rm -rf "$t"
+    return 1
+  fi
+  cat >"$cfg/shell.qml" <<'QML'
+import QtQuick
+import Quickshell
+ShellRoot {
+  id: shell
+  property int pending: 0
+  Component.onCompleted: {
+    var c = Qt.createComponent(Quickshell.env("PW_GATE_URL"), Component.PreferSynchronous)
+    if (c.status !== Component.Ready) {
+      console.log("PWGATE ERROR " + c.errorString().replace(/\n/g, " | "))
+      console.log("PWGATE DONE")
+      Qt.callLater(Qt.quit)
+      return
+    }
+    var dirs = Quickshell.env("PW_GATE_DIRS").split("\n")
+    for (var i = 0; i < dirs.length; i++) {
+      if (dirs[i] === "") continue
+      shell.pending++
+      var g = c.createObject(shell, { dir: dirs[i], name: "current.json", maxBytes: 16384 })
+      ;(function(k, gate) {
+        gate.textRead.connect(function(s, v, f) { console.log("PWGATE " + k + " read " + s.length + " " + f); shell.settled() })
+        gate.failed.connect(function(o) { console.log("PWGATE " + k + " fail " + o); shell.settled() })
+      })(i, g)
+    }
+  }
+  function settled() {
+    if (--shell.pending > 0) return
+    console.log("PWGATE DONE")
+    Qt.callLater(Qt.quit)
+  }
+  Timer { interval: 8000; running: true; onTriggered: { console.log("PWGATE DONE (timeout)"); Qt.quit() } }
+}
+QML
+  local url="file://$(printf '%s' "$dir/GatedFile.qml" | sed 's/ /%20/g')"
+  (cd "$t/cwd" && PW_GATE_URL=$url PW_GATE_DIRS="$t/link/../b"$'\n'"$rel/b"$'\n'"$t/b" \
+    exec qs --no-color -p "$cfg" >"$t/log" 2>&1) &
+  pid=$!
+  for ((i = 0; i < LOAD_TIMEOUT_S * 10; i++)); do
+    kill -0 "$pid" 2>/dev/null || break
+    grep -q 'PWGATE DONE' "$t/log" && break
+    sleep 0.1
+  done
+  for ((i = 0; i < 20; i++)); do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.1
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill "$pid" 2>/dev/null
+    sleep 0.5
+    kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null
+  fi
+  wait "$pid" 2>/dev/null
+
+  local names=("link/../b" "relative b" "absolute b")
+  for n in 0 1 2; do
+    # The gate names the file it read (BarWidget drops a read of another tier).
+    if grep -q "PWGATE $n read ${#small} current.json\$" "$t/log"; then
+      echo "ok   ${names[n]}: read the listed ${#small}-byte file, named current.json"
+    else
+      echo "FAIL ${names[n]}: $(grep "PWGATE $n " "$t/log" | sed 's/.*PWGATE [0-9] //' | head -1)" \
+        "(expected read ${#small} current.json: the listed file)"
+      ok=1
+    fi
+  done
+  if grep -q 'PWGATE ERROR\|PWGATE DONE (timeout)' "$t/log" || ! grep -q 'PWGATE DONE' "$t/log"; then
+    grep 'PWGATE ERROR\|PWGATE DONE' "$t/log" | head -3
+    ok=1
+  fi
+  trap - INT TERM
+  rm -rf "$t"
+  return $ok
+}
+
 run "manifest validation" omarchy plugin validate "$PLUGIN_DIR"
 run "qmllint (qt6)" qml_lint
 run "qmllint self-test (injected unknown type)" qml_lint_selftest
 run "QML load (scratch qs)" qml_load
 run "QML load self-test (function paint)" qml_load_selftest
+run "read gate reads the listed file (scratch qs)" gate_reads_listed
 run "model" node "$PLUGIN_DIR/tests/model-test.js"
 run "manifest and layout" node "$PLUGIN_DIR/tests/manifest-test.js"
 

@@ -28,6 +28,8 @@ const NAMES = [
   "oneOf", "pciAddress", "parseGpuDevices", "isLowerBound", "boundText", "currentStatText",
   "totalLabel", "totalRowValue", "gpuRowValue", "gpuCountText", "gpuListCut", "showsMeasuredAc",
   "finiteIn", "safeLabel", "canvasFont", "rangeFor", "stepFor", "stateDir", "fileUrl", "historyPath",
+  "stateDirProblem", "resolveStateDir", "isCanonicalDir", "recheckMissing", "historyCacheHit",
+  "headChars", "tailChars", "STATE_DIR_SHOWN_CHARS", "STATE_DIR_CHART_TEXT", "baseName", "historyReadRange",
   "parseCurrent", "isStale", "shouldRelist", "gateDecision", "loadFailure", "level", "levelText",
   "statusLine", "restSourceLabel", "sampleTitle", "sampleNotes",
   "formatNumber", "formatWatts", "formatAmps", "formatPercent", "barText", "barLines",
@@ -191,21 +193,48 @@ test("read gate: size checked against the cap before any read, at the boundary",
   assert.deepStrictEqual(model.gateDecision(null, cap, ""), { action: "missing" })
   assert.deepStrictEqual(model.gateDecision({ size: cap + 1, modified: 1 }, cap, ""), { action: "too large" })
   assert.deepStrictEqual(model.gateDecision({ size: 209715200, modified: 1 }, cap, ""), { action: "too large" })
-  assert.deepStrictEqual(model.gateDecision({ size: cap, modified: 5 }, cap, ""), { action: "read", version: cap + ":5" })
+  const at = "/s/current.json"
+  assert.deepStrictEqual(model.gateDecision({ size: cap, modified: 5, path: at }, cap, ""), { action: "read", version: cap + ":5", path: at })
   // A 0-byte entry is never read: /proc files list as 0 and read as megabytes.
   assert.deepStrictEqual(model.gateDecision({ size: 0, modified: 5 }, cap, ""), { action: "missing" })
   assert.deepStrictEqual(model.gateDecision({ size: 0, modified: 5 }, model.HISTORY_MAX_BYTES, "0:5"), { action: "missing" },
     "not even a version remembered from before")
-  assert.deepStrictEqual(model.gateDecision({ size: 1, modified: 5 }, cap, ""), { action: "read", version: "1:5" })
-  assert.deepStrictEqual(model.gateDecision({ size: 600, modified: 5 }, cap, "600:5"), { action: "none" })
-  assert.strictEqual(model.gateDecision({ size: 600, modified: 6 }, cap, "600:5").action, "read")
-  assert.strictEqual(model.gateDecision({ size: 601, modified: 5 }, cap, "600:5").action, "read")
+  assert.deepStrictEqual(model.gateDecision({ size: 1, modified: 5, path: at }, cap, ""), { action: "read", version: "1:5", path: at })
+  assert.deepStrictEqual(model.gateDecision({ size: 600, modified: 5, path: at }, cap, "600:5"), { action: "none" })
+  assert.strictEqual(model.gateDecision({ size: 600, modified: 6, path: at }, cap, "600:5").action, "read")
+  assert.strictEqual(model.gateDecision({ size: 601, modified: 5, path: at }, cap, "600:5").action, "read")
   assert.deepStrictEqual(model.gateDecision({ size: 10, isDir: true }, cap, ""), { action: "unreadable" })
   assert.deepStrictEqual(model.gateDecision({ size: NaN }, cap, ""), { action: "unreadable" })
   assert.deepStrictEqual(model.gateDecision({ size: -1 }, cap, ""), { action: "unreadable" })
   assert.deepStrictEqual(model.gateDecision({ size: 1 }, 0, ""), { action: "too large" }, "no cap = no read")
   assert.ok(model.HISTORY_MAX_BYTES >= 12 * 1048576, "the hard ceiling holds a raw tier at the 0.05 s floor")
   assert.ok(model.CURRENT_MAX_BYTES <= model.CURRENT_MAX_CHARS, "UTF-8 bytes >= chars: the gate implies the parse cap")
+})
+
+test("read gate: the path read is the listed entry's own, never rebuilt", () => {
+  const cap = model.CURRENT_MAX_BYTES
+  // The listing of a relative dir reported //tmp/x/current.json; whatever it
+  // says, that is the file whose size was checked, and the one read.
+  for (const listed of ["/s/current.json", "//tmp/x/current.json", "/a/b/current.json"])
+    assert.strictEqual(model.gateDecision({ size: 40, modified: 1, path: listed }, cap, "").path, listed)
+  // No absolute listed path: nothing to read that the listing vouched for.
+  for (const bad of [undefined, null, "", "tmp/x/current.json", " /s/current.json", 7])
+    assert.deepStrictEqual(model.gateDecision({ size: 40, modified: 1, path: bad }, cap, ""), { action: "unreadable" }, String(bad))
+})
+
+test("a listing that drops a file read just before is re-listed once before it counts as missing", () => {
+  assert.strictEqual(model.recheckMissing("missing", "ok", false), true)
+  assert.strictEqual(model.recheckMissing("missing", "ok", true), false, "only once in a row")
+  for (const outcome of ["missing", "pending", "too large", "unreadable", ""])
+    assert.strictEqual(model.recheckMissing("missing", outcome, false), false, outcome)
+  for (const action of ["read", "none", "too large", "unreadable"])
+    assert.strictEqual(model.recheckMissing(action, "ok", false), false, action)
+  const gate = qmlCode("GatedFile.qml")
+  const settle = gate.slice(gate.indexOf("function settle()"), gate.indexOf("function restart()"))
+  // Checked first, re-lists through callLater (no Timer), and the flag is
+  // cleared by any other decision and by restart().
+  assert.ok(/var decision = Model\.gateDecision\([^\n]*\)\s*if \(Model\.recheckMissing\(decision\.action, gate\.outcome, gate\.rechecked\)\) \{\s*gate\.rechecked = true\s*Qt\.callLater\(gate\.relist\)\s*return\s*\}\s*if \(decision\.action !== "missing"\) gate\.rechecked = false/.test(settle), settle)
+  assert.ok(/function restart\(\) \{[^}]*gate\.rechecked = false/.test(gate))
 })
 
 test("load failures: not found is missing, anything else is unreadable", () => {
@@ -732,6 +761,55 @@ test("a sub-0.12 s interval at the compaction ceiling still charts its newest pa
   assert.strictEqual(r.points[r.points.length - 1].t, JSON.parse(lines[lines.length - 1]).t)
   assert.ok(m.count > 0 && m.runs.length >= 1)
   assert.ok(ms < 1000, "took " + ms + " ms")
+})
+
+test("history lines: only '{' lines up to HISTORY_MAX_LINE_CHARS reach JSON.parse", () => {
+  // A live service's longest line is 134 characters (all three tiers); the
+  // cap leaves headroom over that, and no more.
+  assert.strictEqual(model.HISTORY_MAX_LINE_CHARS, 256)
+  const svc = JSON.stringify({ t: 1761300000.25, n: 1, avg: 123.45, max: 234.56, cpu: 45.67, gpu: 123.45,
+    rest: 25.01, chg: 12.34, ac: 1.0, k: "m" })
+  assert.ok(svc.length < model.HISTORY_MAX_LINE_CHARS)
+  const fill = (n) => JSON.stringify(point(n, { pad: "" })).replace('"pad":""', '"pad":"' + "y".repeat(model.HISTORY_MAX_LINE_CHARS) + '"')
+  const atCap = (n) => { const l = JSON.stringify(point(n, { pad: "" })); return l.replace('"pad":""', '"pad":"' + "y".repeat(model.HISTORY_MAX_LINE_CHARS - l.length) + '"') }
+  assert.strictEqual(atCap(1).length, model.HISTORY_MAX_LINE_CHARS)
+  const r = model.parseHistory([atCap(1), fill(2), " " + JSON.stringify(point(3)), "[" + JSON.stringify(point(4)) + "]",
+    '"x"', "5", JSON.stringify(point(6))].join("\n") + "\n")
+  assert.deepStrictEqual(r.points.map(p => p.t), [1, 6])
+  assert.strictEqual(r.skipped, 5)
+})
+
+test("a tier of nested-bracket junk is skipped faster than a service tier parses", () => {
+  // The audit's input: 4 MiB of [x511 ]x511 lines parsed at 1.6x a valid
+  // tier in the shell's engine (430-560 ms vs 290-350 ms). Now none reaches
+  // JSON.parse; the same junk short enough to pass the length cap neither.
+  const MiB4 = 4 * 1048576
+  const tier = (line) => {
+    const n = Math.floor(MiB4 / (line.length + 1))
+    return { text: (line + "\n").repeat(n), n }
+  }
+  const svcLine = JSON.stringify({ t: 1761300000.25, n: 1, avg: 80.12, max: 90.45, cpu: 8.21, gpu: 38.05,
+    rest: 25.01, chg: 0.0, ac: 1.0, k: "e" })
+  const svcLines = []
+  for (let i = 0, n = Math.floor(MiB4 / (svcLine.length + 1)); i < n; i++)
+    svcLines.push(svcLine.replace("1761300000.25", String(1761300000 + i)))
+  const svcText = svcLines.join("\n") + "\n"
+  const time = (text) => { const t0 = process.hrtime.bigint(); const r = model.parseHistory(text, 1792900000); return [r, Number(process.hrtime.bigint() - t0) / 1e6] }
+  time(svcText)
+  const [svc, svcMs] = time(svcText)
+  assert.strictEqual(svc.skipped, 0)
+  for (const depth of [511, 127]) {
+    const junk = tier("[".repeat(depth) + "]".repeat(depth))
+    assert.ok(junk.text.length <= model.HISTORY_PARSE_CHARS && junk.text.length > model.HISTORY_PARSE_CHARS - 2048)
+    const [r, ms] = time(junk.text)
+    assert.strictEqual(r.points.length, 0)
+    assert.strictEqual(r.skipped, Math.min(junk.n, model.HISTORY_MAX_LINES), "every junk line counts as skipped")
+    // Measured in node: 2-4 ms for either depth against 50-65 ms for the
+    // service tier; before the fix the junk took 160-220 ms. 50 ms is a
+    // generous bound that parsing the junk cannot meet.
+    assert.ok(ms < 50, "depth " + depth + ": " + ms.toFixed(1) + " ms (service tier " + svcMs.toFixed(1) + " ms)")
+    assert.ok(ms < svcMs, "depth " + depth + ": junk " + ms.toFixed(1) + " ms, service tier " + svcMs.toFixed(1) + " ms")
+  }
 })
 
 test("parsing a tier at its compaction ceiling is fast", () => {
@@ -1263,8 +1341,102 @@ test("state dir: same precedence as bin/power-watch state_dir()", () => {
   assert.strictEqual(model.stateDir("", "/", "/home/u"), "/power-watch")
   assert.strictEqual(model.stateDir("/tmp/pw/", "/x", "/home/u"), "/tmp/pw")
   assert.strictEqual(model.stateDir("/", "/x", "/home/u"), "/")
-  // no trimming, as in Python: a space is part of the path
-  assert.strictEqual(model.stateDir(" /tmp/pw", "/x", "/home/u"), " /tmp/pw")
+  assert.strictEqual(model.stateDir("/a/b.c/..d/.e", "/x", "/home/u"), "/a/b.c/..d/.e", "dots inside a name are fine")
+  assert.strictEqual(model.stateDirProblem("/tmp/pw/", "/x", "/home/u"), "")
+  assert.strictEqual(model.stateDirProblem("", "", "/home/u"), "")
+})
+
+test("state dir: a relative path or a . / .. segment is refused, from every source, with a reason", () => {
+  // No trimming, as in Python: a leading space makes the path relative, and
+  // a relative dir is listed (file://tmp/x = /tmp/x) apart from where it is
+  // opened ($CWD/tmp/x); ".." after a symlink is cleaned by the listing and
+  // resolved by the kernel. Refused, never replaced by another directory.
+  const cases = [
+    [["rel", "/x", "/home/u"], "POWER_WATCH_STATE_DIR", "rel"],
+    [[" /tmp/pw", "/x", "/home/u"], "POWER_WATCH_STATE_DIR", " /tmp/pw"],
+    [["tmp/power-watch", "", "/home/u"], "POWER_WATCH_STATE_DIR", "tmp/power-watch"],
+    [["/a/../b", "/x", "/home/u"], "POWER_WATCH_STATE_DIR", "/a/../b"],
+    [["/a/./b", "/x", "/home/u"], "POWER_WATCH_STATE_DIR", "/a/./b"],
+    [["/a/b/..", "/x", "/home/u"], "POWER_WATCH_STATE_DIR", "/a/b/.."],
+    [["/a/b/./", "/x", "/home/u"], "POWER_WATCH_STATE_DIR", "/a/b/./"],
+    [["", "state", "/home/u"], "XDG_STATE_HOME", "state"],
+    [["", "./state", "/home/u"], "XDG_STATE_HOME", "./state"],
+    [["", "/x/../y", "/home/u"], "XDG_STATE_HOME", "/x/../y"],
+    [["", "", "home/u"], "HOME", "home/u"],
+    [["", "", "/home/u/.."], "HOME", "/home/u/.."]
+  ]
+  for (const [args, name, value] of cases) {
+    assert.strictEqual(model.stateDir(...args), "", JSON.stringify(args))
+    const problem = model.stateDirProblem(...args)
+    assert.strictEqual(problem, name + ' is\n"' + value + '",\nnot an absolute path without "." or ".." parts; not read.',
+      "the value is shown as given, spaces kept")
+  }
+  // HOME unset (and no override): no guess at "/.local/state".
+  assert.strictEqual(model.stateDir("", "", ""), "")
+  assert.strictEqual(model.stateDir(undefined, undefined, undefined), "")
+  assert.strictEqual(model.stateDirProblem("", "", ""), "HOME is not set, so the state directory is unknown; not read.")
+  // The shown value is stripped of markup and control characters and capped,
+  // keeping its start and its end (where a ".." usually is).
+  const hostile = model.stateDirProblem("<b>x</b>\u202e\n" + "y".repeat(5000) + "/../z", "", "")
+  const shownOf = problem => problem.split("\n")[1]
+  assert.ok(!/[<>\u202e]/.test(hostile) && hostile.split("\n").length === 3, hostile)
+  assert.ok(shownOf(hostile).startsWith('"bx/by') && hostile.includes("y\u2026y") && shownOf(hostile).endsWith('/../z",'), hostile)
+  const most = model.STATE_DIR_SHOWN_CHARS * 2 + 1
+  const exact = "/" + "a".repeat(most - 4) + "/.."
+  assert.strictEqual(shownOf(model.stateDirProblem(exact, "", "")), '"' + exact + '",', most + " characters are shown whole")
+  const longer = "/" + "a".repeat(most - 3) + "/.."
+  const over = shownOf(model.stateDirProblem(longer, "", ""))
+  assert.strictEqual(over.length, most + 3, "one more is cut to the same length: " + over)
+  assert.ok(over.includes("\u2026"), over)
+  // The cut never splits a surrogate pair, at either end or at the 4096 pre-cut.
+  const pair = "\ud83d\ude00"
+  const lone = s => /[\ud800-\udbff](?![\udc00-\udfff])|(^|[^\ud800-\udbff])[\udc00-\udfff]/.test(s)
+  for (const offset of [0, 1]) {
+    const head = "/" + "a".repeat(model.STATE_DIR_SHOWN_CHARS - 2 + offset) + pair + "b".repeat(80)
+    const tail = "a/" + "b".repeat(80) + pair + "c".repeat(model.STATE_DIR_SHOWN_CHARS - 1 - offset)
+    const both = "/" + "a".repeat(2046 + offset) + pair + "b".repeat(5000) + pair + "c".repeat(2047 - offset) + "/.."
+    for (const value of [head, tail, both]) {
+      const shown = shownOf(model.stateDirProblem(value, "", ""))
+      assert.ok(!lone(shown), "a lone surrogate in: " + JSON.stringify(shown))
+    }
+  }
+  assert.strictEqual(model.headChars("ab" + pair, 3), "ab")
+  assert.strictEqual(model.headChars("ab" + pair, 4), "ab" + pair)
+  assert.strictEqual(model.tailChars(pair + "ab", 3), "ab")
+  assert.strictEqual(model.tailChars(pair + "ab", 4), pair + "ab")
+  assert.strictEqual(model.headChars("abc", 5), "abc")
+  // The bar tooltip never wraps: every line of every refusal, from the
+  // longest value, fits a sane width; the status line gets one paragraph.
+  const refusals = [model.stateDirProblem("", "", ""), hostile, model.stateDirProblem(longer, "", ""),
+    model.stateDirProblem("", "x".repeat(400), "/home/u"), model.stateDirProblem("", "", "h".repeat(400))]
+  for (const problem of refusals) {
+    for (const line of model.tooltipText(null, true, "missing", problem).split("\n"))
+      assert.ok(line.length <= 80, "a tooltip line over 80 characters: " + line)
+    assert.ok(!model.staleMessage(null, "missing", problem).includes("\n"), "one paragraph in the status line")
+    // Ends like the other refusals to read ("...; not read.").
+    assert.ok(/; not read\.$/.test(problem), problem)
+  }
+  // The chart draws its empty text as one unwrapped canvas line: a short
+  // label, no longer than its other empty texts, not the reason itself.
+  assert.ok(model.STATE_DIR_CHART_TEXT.length <= 32 && model.STATE_DIR_CHART_TEXT.length > 0, model.STATE_DIR_CHART_TEXT)
+  // Said in place of "service not running", and apart from it.
+  const problem = model.stateDirProblem("rel", "", "")
+  assert.strictEqual(model.staleMessage(null, "missing", problem), problem.replace(/\n/g, " "))
+  assert.notStrictEqual(model.staleMessage(null, "missing", problem), model.staleMessage(null, "missing"))
+  assert.strictEqual(model.tooltipText(null, true, "missing", problem), problem, "no 'start the service' hint")
+  assert.strictEqual(model.staleMessage(null, "missing", ""), model.staleMessage(null, "missing"))
+  assert.strictEqual(model.tooltipText(null, true, "missing", ""), model.tooltipText(null, true, "missing"))
+  // The widget shows it in the hero, the tooltip and the chart, and hides
+  // the service hint: never an eternal "Loading history".
+  const bar = qmlCode("BarWidget.qml")
+  assert.ok(/readonly property string stateDirProblem:\s*Model\.stateDirProblem\(Quickshell\.env\("POWER_WATCH_STATE_DIR"\),\s*Quickshell\.env\("XDG_STATE_HOME"\), Quickshell\.env\("HOME"\)\)/.test(bar))
+  assert.ok(/readonly property string stateDir:\s*Model\.stateDir\(Quickshell\.env\("POWER_WATCH_STATE_DIR"\),\s*Quickshell\.env\("XDG_STATE_HOME"\), Quickshell\.env\("HOME"\)\)/.test(bar))
+  assert.ok(/Model\.staleMessage\(root\.current, root\.currentError, root\.stateDirProblem\)/.test(bar))
+  assert.ok(/Model\.tooltipText\(root\.current, root\.stale, root\.currentError, root\.stateDirProblem\)/.test(bar))
+  assert.ok(/emptyText:\s*root\.stateDirProblem !== "" \? Model\.STATE_DIR_CHART_TEXT\s*:/.test(bar))
+  assert.ok(/visible:\s*root\.stale && root\.stateDirProblem === ""\s*width:[^\n]*\s*wrapMode:[^\n]*\s*text:\s*Model\.SERVICE_HINT/.test(bar))
+  // An empty dir is never listed: the gate does nothing at all with it.
+  assert.ok(/function relist\(\) \{\s*if \(gate\.dir === "" \|\| gate\.name === ""\) return/.test(qmlCode("GatedFile.qml")))
 })
 
 const skipped = (name, why) => {
@@ -1377,6 +1549,139 @@ test("no Process anywhere, and the only repeating timer is the staleness check",
   }
 })
 
+// Every .qml and .js under the plugin folder (the shell loads the root ones;
+// tests/ is shipped too), except this file, whose patterns and fixtures name
+// what is banned.
+function codeFiles(dir) {
+  const out = []
+  for (const name of fs.readdirSync(dir)) {
+    if (name === ".git" || name === "node_modules") continue
+    const full = path.join(dir, name)
+    if (fs.statSync(full).isDirectory()) out.push(...codeFiles(full))
+    else if (/\.(qml|js)$/.test(name) && full !== __filename) out.push(full)
+  }
+  return out
+}
+
+// The text with its comments blanked, newlines kept (so lines still line up
+// with the source). A "//" or "/*" inside a string, template or regex literal
+// is not a comment; a string or regex still open at a newline ends there
+// (neither spans lines in JS or QML), so an odd quote cannot hide the rest of
+// a file. A "/" is a regex only after an operator or opening bracket.
+function withoutComments(text) {
+  let out = ""
+  let prev = ""
+  for (let i = 0; i < text.length;) {
+    const c = text[i]
+    const d = text[i + 1]
+    if (c === "/" && d === "/") {
+      while (i < text.length && text[i] !== "\n") i++
+      continue
+    }
+    if (c === "/" && d === "*") {
+      const close = text.indexOf("*/", i + 2)
+      const stop = close < 0 ? text.length : close + 2
+      out += text.slice(i, stop).replace(/[^\n]/g, "")
+      i = stop
+      continue
+    }
+    if (c === '"' || c === "'" || c === "`" || (c === "/" && (prev === "" || "(,=:[!&|?{};+-*%<>~^".includes(prev)))) {
+      let j = i + 1
+      let inClass = false
+      while (j < text.length) {
+        const e = text[j]
+        if (e === "\\") { j += 2; continue }
+        if (e === "\n" && c !== "`") break
+        j++
+        if (c !== "/") { if (e === c) break; continue }
+        if (e === "[") inClass = true
+        else if (e === "]") inClass = false
+        else if (e === "/" && !inClass) break
+      }
+      out += text.slice(i, j)
+      prev = "a"
+      i = j
+      continue
+    }
+    out += c
+    if (!/\s/.test(c)) prev = c
+    i++
+  }
+  return out
+}
+
+const NETWORK_BANS = [
+  [/\bXMLHttpRequest\b/, "XMLHttpRequest"],
+  [/\b(WebSocket|WebSocketServer|Socket|SocketServer|TcpSocket|UdpSocket|LocalSocket)\b/, "a socket"],
+  [/\bopenUrlExternally\b/, "Qt.openUrlExternally"],
+  [/\bfetch\s*\(/, "fetch()"],
+  [/\bNetworkInformation\b|\bNetworkAccessManager\b/, "a network type"],
+  [/^\s*import\s+(QtWebSockets|QtNetwork|QtWebEngine|QtWebView|QtWebChannel|Quickshell\.Networking)\b/m, "a network module"],
+  [/\b(https?|wss?|ftps?):\/\//i, "a remote URL"],
+  [/\brequire\s*\(\s*["'](https?|net|dgram|tls|http2)["']\s*\)/, "a node network module"]
+]
+
+// Every banned use in a source text, as "line N: what (match)". Two checks,
+// so a mistake in the comment stripper alone lets nothing through: the code
+// without comments must have no hit, and a hit in the raw text is allowed
+// only on a line that is a comment and nothing else — it starts with "//",
+// "/*" or "*" and the stripper left it blank. A banned word in a trailing
+// comment after code counts as a hit.
+function networkHits(text) {
+  const hits = []
+  const code = withoutComments(text)
+  for (const [re, what] of NETWORK_BANS) {
+    const hit = code.match(re)
+    if (hit) hits.push("code: " + what + " (" + hit[0] + ")")
+  }
+  const raw = text.split("\n")
+  const stripped = code.split("\n")
+  raw.forEach((line, n) => {
+    const comment = /^\s*(\/\/|\/\*|\*)/.test(line) && (stripped[n] || "").trim() === ""
+    if (comment) return
+    for (const [re, what] of NETWORK_BANS) {
+      const hit = line.match(re)
+      if (hit) hits.push("line " + (n + 1) + ": " + what + " (" + hit[0] + ")")
+    }
+  })
+  return hits
+}
+
+test("no network: no network API, module or remote URL in any .qml or .js", () => {
+  const files = codeFiles(pluginDir)
+  const rel = files.map(f => path.relative(pluginDir, f)).sort()
+  for (const f of qmlFiles.concat(["Model.js", "tests/manifest-test.js", "tests/qmllint-check.js"]))
+    assert.ok(rel.includes(f), "scanned: " + f + " (got " + rel.join(", ") + ")")
+  for (const file of files) {
+    const hits = networkHits(fs.readFileSync(file, "utf8"))
+    assert.deepStrictEqual(hits, [], path.relative(pluginDir, file) + " uses the network: " + hits.join("; "))
+  }
+  // The stripper keeps what a comment-only strip would lose.
+  assert.ok(/https:\/\/x/.test(withoutComments('var u = "https://x" // c')))
+  assert.ok(!/secret/.test(withoutComments("a() // https://secret\n/* http://secret */ b()")))
+  assert.ok(/x\(\)/.test(withoutComments('var s = "//"; x()')), "a // inside a string is not a comment")
+  assert.ok(/x\(\)/.test(withoutComments("var r = /\\/\\//; x()")), "nor one inside a regex")
+  assert.ok(/x\(\)/.test(withoutComments('var a = "/*"\nx()\nvar b = "*/"')), "a /* inside a string opens nothing")
+  assert.ok(/x\(\)/.test(withoutComments('var q = "unclosed\nx()')), "a string ends at its line")
+  assert.strictEqual(withoutComments("a\n/* b\nc */\nd").split("\n").length, 4, "lines are kept")
+  // Comment lines may name banned things (the headers do); nothing else may.
+  for (const ok of ["// see https://example.org", "/* a WebSocket */", "/*\n * https://example.org\n */",
+    "  // XMLHttpRequest is not used", 'var u = "file:///tmp/x"'])
+    assert.deepStrictEqual(networkHits(ok), [], ok)
+  // Each pattern bites, and neither the old stripper's two bypasses (a "//"
+  // inside a string before the call; lines between a "/*" and a "*/" that
+  // are both inside strings) nor a trailing comment hides a use.
+  for (const bad of ['var r = new XMLHttpRequest()', 'Socket { path: "/run/x" }', 'Qt.openUrlExternally(u)',
+    'import QtWebSockets', 'import Quickshell.Networking', 'Image { source: "https://example.org/p.png" }',
+    'WebSocket { url: "ws://h" }', 'fetch\n(u)', 'var n = require("net")',
+    'var s = "//"; new XMLHttpRequest()',
+    'var a = "/*"\nvar r = new XMLHttpRequest()\nvar b = "*/"',
+    'var a = "/*"\n * new XMLHttpRequest()\nvar b = "*/"',
+    "var r = /\\/\\//; new XMLHttpRequest()",
+    "x() // https://example.org", "/* x */ new XMLHttpRequest()"])
+    assert.ok(networkHits(bad).length > 0, "not caught: " + JSON.stringify(bad))
+})
+
 test("history is only watched and read while the panel is open", () => {
   const qml = qmlCode("BarWidget.qml")
   assert.ok(/id:\s*historyLoader[\s\S]{0,200}active:\s*root\.opened/.test(qml),
@@ -1394,6 +1699,57 @@ test("history is only watched and read while the panel is open", () => {
   assert.ok(/GatedFile\s*\{[\s\S]*?maxBytes:\s*Model\.HISTORY_MAX_BYTES/.test(loader), "history goes through the read gate")
 })
 
+test("a range switched back to reuses its parse only for the same file version, within refreshMs", () => {
+  const history = { points: [], skipped: 0, truncated: false, error: "", at: 1000 }
+  const entry = { version: "600:5", history }
+  assert.strictEqual(model.historyCacheHit(entry, "600:5", 1000, 5000), true)
+  assert.strictEqual(model.historyCacheHit(entry, "600:5", 1004.999, 5000), true)
+  assert.strictEqual(model.historyCacheHit(entry, "600:5", 1005, 5000), false, "as old as the throttle window: read anew")
+  assert.strictEqual(model.historyCacheHit(entry, "600:5", 999, 5000), false, "a clock that went back")
+  assert.strictEqual(model.historyCacheHit(entry, "601:5", 1001, 5000), false, "another size")
+  assert.strictEqual(model.historyCacheHit(entry, "600:6", 1001, 5000), false, "another mtime")
+  assert.strictEqual(model.historyCacheHit(entry, "", 1001, 5000), false)
+  assert.strictEqual(model.historyCacheHit({ version: "", history }, "", 1001, 5000), false)
+  assert.strictEqual(model.historyCacheHit(undefined, "600:5", 1001, 5000), false)
+  assert.strictEqual(model.historyCacheHit({ version: "600:5" }, "600:5", 1001, 5000), false)
+  assert.strictEqual(model.historyCacheHit(entry, "600:5", NaN, 5000), false)
+  for (const r of model.RANGES) assert.strictEqual(model.historyCacheHit(entry, "600:5", 1000 + r.refreshMs / 1000, r.refreshMs), false, r.key)
+  // The widget: keyed by range, checked before parsing with that range's
+  // refreshMs and the version the gate hands over with the text; one entry
+  // per range (assigned, never pushed); a failure drops it; closing drops all.
+  const bar = qmlCode("BarWidget.qml")
+  const apply = bar.slice(bar.indexOf("function applyHistory("), bar.indexOf("function applyHistoryFailure("))
+  assert.ok(/^function applyHistory\(text, version, fileName\) \{\s*var key = Model\.historyReadRange\(fileName, root\.range\)\s*if \(key === ""\) return\s*var at = Date\.now\(\) \/ 1000\s*var cached = root\.historyCache\[key\]\s*if \(Model\.historyCacheHit\(cached, version, at, Model\.rangeFor\(key\)\.refreshMs\)\) \{\s*root\.history = cached\.history\s*return\s*\}\s*var parsed = Model\.parseHistory\(text, at\)/.test(apply), apply)
+  assert.ok(/root\.historyCache\[key\] = \{ version: version, history: history \}/.test(apply))
+  assert.ok(/delete root\.historyCache\[root\.range\]/.test(bar.slice(bar.indexOf("function applyHistoryFailure("), bar.indexOf("function selectRange("))))
+  assert.ok(/onOpenedChanged:\s*\{\s*if \(root\.opened\) return[\s\S]*?root\.historyCache = \(\{\}\)/.test(bar))
+  assert.strictEqual((bar.match(/root\.historyCache\s*=/g) || []).length, 1, "only the close resets the cache object")
+  assert.ok(/onTextRead:\s*function\(content, version, fileName\) \{ root\.applyHistory\(content, version, fileName\) \}/.test(bar))
+  const gate = qmlCode("GatedFile.qml")
+  assert.ok(/signal textRead\(string content, string version, string fileName\)/.test(gate))
+  assert.ok(/gate\.textRead\(file\.text\(\), gate\.version, Model\.baseName\(file\.path\)\)/.test(gate))
+})
+
+test("a history read is shown and cached only as the range whose tier it came from", () => {
+  // A range switch renames the gate's file and restarts it a turn later, so
+  // a load of the old tier can land after root.range moved: it is dropped.
+  for (const r of model.RANGES) {
+    assert.strictEqual(model.historyReadRange(r.file, r.key), r.key, r.key)
+    for (const other of model.RANGES) if (other !== r)
+      assert.strictEqual(model.historyReadRange(other.file, r.key), "", other.file + " read while on " + r.key)
+  }
+  assert.strictEqual(model.historyReadRange("", "1h"), "")
+  assert.strictEqual(model.historyReadRange(undefined, "1h"), "")
+  assert.strictEqual(model.historyReadRange("current.json", "1h"), "")
+  // An unknown key is not the first range's, whose file rangeFor falls back to.
+  assert.strictEqual(model.historyReadRange(model.RANGES[0].file, "2h"), "")
+  assert.strictEqual(model.baseName("/s/p w/history-raw.jsonl"), "history-raw.jsonl")
+  assert.strictEqual(model.baseName("file:///s/history-1m.jsonl"), "history-1m.jsonl")
+  assert.strictEqual(model.baseName("history-15m.jsonl"), "history-15m.jsonl")
+  assert.strictEqual(model.baseName(""), "")
+  assert.strictEqual(model.baseName(null), "")
+})
+
 test("every file read goes through the size gate: FileView only in GatedFile.qml", () => {
   for (const file of qmlFiles) {
     const qml = qmlCode(file)
@@ -1405,10 +1761,18 @@ test("every file read goes through the size gate: FileView only in GatedFile.qml
   // the one settle() makes after gateDecision said "read".
   assert.ok(/FileView\s*\{\s*id:\s*file\s*path:\s*""/.test(gate), "the FileView starts with an empty path")
   const sets = gate.match(/file\.path\s*=\s*[^=\n]+/g) || []
-  assert.deepStrictEqual(sets.map(x => x.trim()).filter(x => !/=\s*""$/.test(x)), ["file.path = gate.filePath"])
+  assert.deepStrictEqual(sets.map(x => x.trim()).filter(x => !/=\s*""$/.test(x)), ["file.path = decision.path"])
   const settle = gate.slice(gate.indexOf("function settle()"), gate.indexOf("onDirChanged"))
-  assert.ok(/Model\.gateDecision\([\s\S]*decision\.action === "read"[\s\S]*file\.path = gate\.filePath/.test(settle),
+  assert.ok(/Model\.gateDecision\([\s\S]*decision\.action === "read"[\s\S]*file\.path = decision\.path/.test(settle),
     "the path is set only after the gate said read")
+  // The path read is the one the listing stat'ed: the decision's path comes
+  // from entry(), which takes it from the listed entry itself; nothing builds
+  // a path from dir and name.
+  assert.ok(/var decision = Model\.gateDecision\(gate\.entry\(\), gate\.maxBytes, gate\.version\)/.test(settle))
+  assert.ok(/if \(file\.path === decision\.path\) file\.reload\(\)\s*else file\.path = decision\.path/.test(settle))
+  const entry = gate.slice(gate.indexOf("function entry()"), gate.indexOf("function fail("))
+  assert.ok(/if \(listing\.get\(i, "fileName"\) !== gate\.name\) continue[\s\S]*path:\s*listing\.get\(i, "filePath"\)/.test(entry), entry)
+  assert.ok(!/gate\.dir\s*\+|\+\s*gate\.name|filePath:\s*gate\./.test(gate), "no path rebuilt from dir and name")
   assert.ok(!/file\.reload\(\)[\s\S]*Model\.gateDecision/.test(settle), "no reload before the decision")
   // text() only once the gated read has completed
   assert.strictEqual((gate.match(/\.text\(\)/g) || []).length, 1)
