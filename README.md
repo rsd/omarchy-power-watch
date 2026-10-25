@@ -16,6 +16,26 @@ service. Plugin id `io.github.rsd.power-watch`.
   current sample and the CPU/GPU power caps. Left/right change the range. Adapter
   amps and the share of the adapter rating show "Not configured" when the
   service has no voltage or rating.
+- **Colours.** The average, Max and the AC bands use the theme's foreground,
+  the threshold its urgent colour, and all text stays foreground. CPU, GPU and
+  the battery band each get their own colour (Mixed is the Battery colour at
+  alpha 0.45), derived from the theme: CPU keeps the accent's hue, GPU and
+  Battery are hues rotated from it in OKLCH. All three stay far apart for
+  normal and colour-blind vision, have at least 3:1 contrast against the panel
+  background (dark or light is judged from the panel background itself, so a
+  foreground equal to the background cannot undo it), keep clear of the urgent
+  hue, and stay out of the red hues (OKLCH 345–45°) whatever urgent is; an
+  accent in either is moved just clear of it. A grey theme (accent equal to the
+  foreground) still gets three hues. The series also differ in pattern: CPU is
+  a thick solid line, GPU thick long dashes, Max thin dots. The colours are
+  worked out only while the panel is open.
+- **CPU cap.** When the service reports its CPU power-cap state, the CPU limit
+  reads "PL1 45 W (capped)" (in the accent colour), "PL1 91 W (uncapped)", or
+  "PL1 91 W (45 W cap reverted)" (in the urgent colour, with the note "CPU cap
+  reverted by something else; see power-cap status."): something other than
+  power-watch undid the cap. Without a usable cap figure (missing or 0 W) it
+  reads "PL1 91 W (cap reverted)". An older power-watch that does not report
+  it shows plain "PL1 91 W".
 - **Staleness.** When the service stops, the number turns into `-- W`, the widget
   dims and the panel says so and shows how to start the service.
 
@@ -91,10 +111,11 @@ is stripped of control and markup characters and capped):
 | `total_w`, `total_kind` (`measured`/`estimated`), `total_source` (`battery`/`psys`/`model`), `total_lower_bound`, `incomplete` | the bar number, its label and the "≥" mark |
 | `threshold_w` (default 150) | normal / approaching (85 %) / over |
 | `ac_online`, `battery_status`, `battery_capacity` (0–100), `charge_w` | power source and charging row |
-| `cpu_w`, `gpu_w`, `rest_w`, `rest_source` | breakdown |
+| `cpu_w`, `gpu_w`, `rest_w`, `rest_source` (`calibrate` shows as "calibrated", `passive` as "passively calibrated", `default` as a warning) | breakdown |
 | `gpu_status` (`active`/`suspended`/`none`/`disabled`/`unknown`), `gpu_pstate`, `gpu_devices` (each entry's `status`, and how many there are; at most 16 kept) | GPU row |
 | `adapter_v`, `adapter_current_a`, `adapter_rating_w` | amps and share of rating; `null` = "Not configured" |
 | `cpu_limit_w`, `gpu_limit_w`, `gpu_max_limit_w` | power caps |
+| `cpu_cap` (`capped`/`uncapped`/`reverted`), `cpu_cap_w` (the PL1 cap applied, W), both optional | CPU cap state after PL1; absent, `null` or any other value = not reported, plain "PL1 N W" |
 | `errors` (only its length) | "sensor error(s)" note |
 
 Parsed and validated but not shown: `battery_w`, `psys_w`, and the `pci`,
@@ -106,8 +127,10 @@ means unknown, and is shown in words ("Not configured", "Suspended") or as a
 dash, never as 0.
 
 **`history-raw.jsonl`** (1h), **`history-1m.jsonl`** (24h), **`history-15m.jsonl`**
-(7d): JSON Lines, read only while the panel is open, at most every 5 s, and never
-when larger than 16 MiB. A line is an object with `t` (bucket start, Unix
+(7d): JSON Lines, read only while the panel is open, never when larger than
+16 MiB, and at most every 5 s for 1h and once a minute for 24h and 7d (those
+tiers change once a minute or less). Opening the panel or switching the range
+reads at once. A line is an object with `t` (bucket start, Unix
 seconds), `n` (samples), `avg` and `max` (total, W), `cpu`, `gpu`, `rest`, `chg`
 (W), `ac` (fraction of samples on AC, 0–1) and `k` (`m` measured, `e`
 estimated, `x` mixed). Points more than 2.5 steps apart are drawn as a gap, never
@@ -137,8 +160,9 @@ the service is not running (`systemctl --user enable --now power-watch.service`)
 is display text; nothing executes it. It does not read the power-watch
 configuration. The only repeating timer is a 10 s staleness check that
 compares two numbers (and re-lists the state directory while `current.json` is
-missing); besides it there are two single-shot timers, one that rate-limits
-reads to once a second and one that settles a state directory that does not exist.
+missing); besides it there are two single-shot timers per file, one that
+rate-limits reads (`current.json` to once a second, history per range) and one
+that settles a state directory that does not exist.
 
 ### Notes for reviewers
 
@@ -157,8 +181,9 @@ reads to once a second and one that settles a state directory that does not exis
 
 At the service's fastest interval (0.05 s) the 1h raw history file fills the
 parse budget (4 MiB / 40 000 lines), and parsing it takes about 310 ms on the UI
-thread every 5 s while the panel is open (measured). At the default 2 s interval
-it is about 15 ms. The budget is not lowered in this version.
+thread every 5 s while the panel is open on the 1h range (measured). At the
+default 2 s interval it is about 15 ms. The 24h and 7d tiers reload at most once
+a minute. The budget is not lowered in this version.
 
 ## Dev workflow
 

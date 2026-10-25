@@ -7,21 +7,23 @@ import "Model.js" as Model
 //
 // Repaints are driven by `chart` changing, and `chart` is a binding over the
 // parsed history, the range and two scalar properties — so new data reaches it
-// at most once per Model.HISTORY_THROTTLE_MS, however often the files change
-// (see the history Loader in BarWidget.qml). current.json updating every two
-// seconds does not repaint it.
+// at most once per range's Model.RANGES[].refreshMs, however often the files
+// change (see the history Loader in BarWidget.qml). current.json updating
+// every two seconds does not repaint it.
 //
 // Text is painted with fillText from strings the model built out of numbers;
 // nothing file-sourced is drawn here. Widths, dashes and margins go through
 // Style.space/spaceReal, so the chart scales with the shell's spacing.
-// How each series looks is Model.CHART_STYLE, shared with the legend.
+// How each series looks is Model.CHART_STYLE, and every colour comes in as
+// `colors` (Model.chartColors), both shared with the legend. Text and grid
+// wear the foreground, never a series colour.
 Canvas {
   id: root
 
   property var chart: null
   property color foreground: "white"
-  property color accent: "white"
-  property color urgent: "red"
+  // Model.chartColors: { cpu, gpu, battery, ... } as { r, g, b, a }.
+  property var colors: null
   // Behind the threshold label, so it stays legible over the data.
   property color labelBackground: "black"
   property string fontFamily: "monospace"
@@ -41,6 +43,9 @@ Canvas {
   function rgba(c, a) {
     return "rgba(" + Math.round(c.r * 255) + "," + Math.round(c.g * 255) + "," + Math.round(c.b * 255) + "," + a + ")"
   }
+
+  // A Model.chartColors entry as a Canvas colour string.
+  function paintOf(c) { return rgba(c, c.a) }
 
   function strokePolys(ctx, polys, color, width) {
     ctx.strokeStyle = color
@@ -71,12 +76,9 @@ Canvas {
     ctx.stroke()
   }
 
-  function spanColor(mode) {
-    if (mode === "battery") return rgba(root.accent, root.look.batteryAlpha)
-    if (mode === "mixed") return rgba(root.accent, root.look.mixedAlpha)
-    if (mode === "acMeasured") return rgba(root.foreground, root.look.acMeasuredAlpha)
-    if (mode === "ac") return rgba(root.foreground, root.look.acAlpha)
-    return rgba(root.foreground, root.look.unknownAlpha)
+  // Each band mode (Model.pointMode) has its chartColors entry.
+  function spanColor(col, mode) {
+    return paintOf(Model.bandColor(col, mode))
   }
 
   // Text on a backdrop, so it stays legible over grid lines and data.
@@ -92,8 +94,7 @@ Canvas {
   onWidthChanged: requestPaint()
   onHeightChanged: requestPaint()
   onForegroundChanged: requestPaint()
-  onAccentChanged: requestPaint()
-  onUrgentChanged: requestPaint()
+  onColorsChanged: requestPaint()
   onLabelBackgroundChanged: requestPaint()
 
   onPaint: {
@@ -101,6 +102,10 @@ Canvas {
     if (!ctx) return
     ctx.reset()
     var lay = Model.chartLayout(root.chart, width, height, root.metrics)
+    // Colours come from the owner only (BarWidget's chartColors), never
+    // derived here a second time.
+    var col = root.colors
+    if (!col) return
     var plot = lay.plot
     ctx.font = Model.canvasFont(root.fontSize, root.fontFamily)
     ctx.textBaseline = "middle"
@@ -108,7 +113,7 @@ Canvas {
     // battery periods shaded behind everything, so they read inside the plot too
     for (var b = 0; b < lay.spans.length; b++) {
       if (lay.spans[b].mode !== "battery") continue
-      ctx.fillStyle = rgba(root.accent, 0.08)
+      ctx.fillStyle = paintOf(col.batteryShade)
       ctx.fillRect(lay.spans[b].x, plot.y, lay.spans[b].w, plot.h)
     }
 
@@ -142,7 +147,7 @@ Canvas {
     }
 
     // total average: filled area down to the axis, one shape per gap-free run
-    ctx.fillStyle = rgba(root.foreground, root.look.areaAlpha)
+    ctx.fillStyle = paintOf(col.average)
     for (var a = 0; a < lay.area.length; a++) {
       var poly = lay.area[a]
       ctx.beginPath()
@@ -152,26 +157,26 @@ Canvas {
       ctx.closePath()
       ctx.fill()
     }
-    strokePolys(ctx, lay.area, rgba(root.foreground, root.look.areaLineAlpha), 1)
+    strokePolys(ctx, lay.area, paintOf(col.averageLine), 1)
 
-    // Max thin dotted, CPU thick solid accent, GPU thick long-dashed accent:
-    // told apart by pattern and weight even where accent == foreground.
-    strokeDashed(ctx, lay.max, rgba(root.foreground, root.look.maxAlpha), Math.max(1, root.px(root.look.maxWidth)),
+    // Max thin dotted foreground, CPU thick solid, GPU thick long-dashed, each
+    // in its own derived colour: told apart by pattern and weight as well.
+    strokeDashed(ctx, lay.max, paintOf(col.max), Math.max(1, root.px(root.look.maxWidth)),
       Math.max(1, root.px(root.look.maxDash[0])), Math.max(1, root.px(root.look.maxDash[1])))
-    strokePolys(ctx, lay.cpu, rgba(root.accent, 1), root.px(root.look.cpuWidth))
-    strokeDashed(ctx, lay.gpu, rgba(root.accent, root.look.gpuAlpha), root.px(root.look.gpuWidth),
+    strokePolys(ctx, lay.cpu, paintOf(col.cpu), root.px(root.look.cpuWidth))
+    strokeDashed(ctx, lay.gpu, paintOf(col.gpu), root.px(root.look.gpuWidth),
       root.px(root.look.gpuDash[0]), root.px(root.look.gpuDash[1]))
 
     // threshold
     var ty = Math.round(lay.thresholdY) + 0.5
-    strokeDashed(ctx, [[[plot.x, ty], [plot.x + plot.w, ty]]], rgba(root.urgent, 1), 1,
+    strokeDashed(ctx, [[[plot.x, ty], [plot.x + plot.w, ty]]], paintOf(col.threshold), 1,
       root.px(root.look.thresholdDash[0]), root.px(root.look.thresholdDash[1]))
     if (root.chart) {
       var limitText = Model.formatWatts(root.chart.threshold)
       var limitX = plot.x + plot.w - root.px(3)
       var limitY = ty - root.fontSize * 0.75
       labelBox(ctx, limitText, limitX, limitY, "right")
-      ctx.fillStyle = rgba(root.urgent, 1)
+      ctx.fillStyle = paintOf(col.threshold)
       ctx.textAlign = "right"
       ctx.fillText(limitText, limitX, limitY)
     }
@@ -183,7 +188,7 @@ Canvas {
     ctx.lineTo(plot.x + plot.w, Math.round(lay.baseY) + 0.5)
     ctx.stroke()
     for (var s = 0; s < lay.spans.length; s++) {
-      ctx.fillStyle = spanColor(lay.spans[s].mode)
+      ctx.fillStyle = spanColor(col, lay.spans[s].mode)
       ctx.fillRect(lay.spans[s].x, lay.bandY, lay.spans[s].w, lay.bandH)
     }
 

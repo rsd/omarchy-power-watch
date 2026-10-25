@@ -17,13 +17,14 @@ const pluginDir = path.join(__dirname, "..")
 const source = fs.readFileSync(path.join(pluginDir, "Model.js"), "utf8")
 const NAMES = [
   "APPROACH_FRACTION", "STALE_INTERVALS", "DEFAULT_INTERVAL_S", "DEFAULT_THRESHOLD_W",
-  "STALE_CHECK_MS", "HISTORY_THROTTLE_MS", "GAP_STEPS",
+  "STALE_CHECK_MS", "HISTORY_MIN_REFRESH_MS", "GAP_STEPS",
   "CURRENT_MAX_BYTES", "HISTORY_MAX_BYTES",
   "CURRENT_MAX_CHARS", "HISTORY_PARSE_CHARS", "HISTORY_MAX_LINES", "HISTORY_MAX_LINE_CHARS",
   "MAX_RENDER_POINTS", "MAX_DASH_SEGMENTS", "RANGES", "SERVICE_HINT", "CHART_STYLE",
   "BREAKDOWN_ROWS_PER_COLUMN", "TOTAL_SOURCES", "GPU_STATUSES", "MAX_GPU_DEVICES", "LOWER_BOUND_MARK",
   "MAX_GPU_DEVICE_SCAN", "BAR_WIDEST_TEXT", "BAR_VERTICAL_SLOTS", "PSYS_LABEL", "PSYS_BAND_LABEL",
-  "CURRENT_READ_MIN_MS",
+  "CURRENT_READ_MIN_MS", "CPU_CAP_STATES", "SERIES_COLOR", "BAND_MODES",
+  "seriesColors", "chartColors", "bandColor",
   "oneOf", "pciAddress", "parseGpuDevices", "isLowerBound", "boundText", "currentStatText",
   "totalLabel", "totalRowValue", "gpuRowValue", "gpuCountText", "gpuListCut", "showsMeasuredAc",
   "finiteIn", "safeLabel", "canvasFont", "rangeFor", "stepFor", "stateDir", "fileUrl", "historyPath",
@@ -168,7 +169,9 @@ test("the staleness tick re-lists only while current.json is absent, never a pre
   for (const outcome of ["too large", "unreadable", "ok", "pending", ""])
     assert.strictEqual(model.shouldRelist(outcome), false, outcome)
   assert.ok(model.STALE_CHECK_MS >= 10000, "staleness check must be >= 10 s")
-  assert.ok(model.HISTORY_THROTTLE_MS >= 5000, "history repaint throttle must be >= 5 s")
+  assert.ok(model.HISTORY_MIN_REFRESH_MS >= 5000, "history repaint throttle must be >= 5 s")
+  for (const r of model.RANGES)
+    assert.ok(r.refreshMs >= model.HISTORY_MIN_REFRESH_MS, r.key + " reloads faster than the floor")
 })
 
 test("levels: normal, approaching at 85% of threshold, over at threshold", () => {
@@ -279,7 +282,7 @@ test("breakdown rows cover CPU, GPU, rest+source, charging, amps, rating, kind, 
   const get = label => rows.find(r => r.label === label).value
   assert.strictEqual(get("CPU"), "8 W")
   assert.strictEqual(get("GPU"), "15 W (P5)")
-  assert.strictEqual(get("Rest"), "30 W (calibrate calibration)")
+  assert.strictEqual(get("Rest"), "30 W (calibrated)")
   assert.strictEqual(get("Charging"), "12 W")
   assert.strictEqual(get("Battery"), "Not charging, 63%")
   assert.strictEqual(get("Adapter current"), "2.7 A")
@@ -293,11 +296,18 @@ test("breakdown rows cover CPU, GPU, rest+source, charging, amps, rating, kind, 
   assert.deepStrictEqual(rows.slice(col).map(r => r.label), ["Power source", "Battery", "Adapter current", "Of adapter rating"])
 })
 
-test("wording: rest source as the CLI prints it, sentence-case unknowns", () => {
-  assert.strictEqual(model.restSourceLabel("calibrate"), "calibrate calibration")
-  assert.strictEqual(model.restSourceLabel("passive"), "passive calibration")
+test("wording: rest source in words, sentence-case unknowns", () => {
+  // rest_source values are the service's contract; only their wording is ours.
+  assert.strictEqual(model.restSourceLabel("calibrate"), "calibrated")
+  assert.strictEqual(model.restSourceLabel("passive"), "passively calibrated")
   assert.strictEqual(model.restSourceLabel("default"), "DEFAULT — run power-watch calibrate")
   assert.strictEqual(model.restSourceLabel(""), "")
+  // Anything else is the (already sanitised) value itself, never "x calibration".
+  assert.strictEqual(model.restSourceLabel("measured"), "measured")
+  assert.strictEqual(model.restSourceLabel("toString"), "toString")
+  assert.strictEqual(model.breakdown(parsed({ rest_source: "passive" })).find(r => r.label === "Rest").value,
+    "30 W (passively calibrated)")
+  assert.strictEqual(model.breakdown(parsed({ rest_source: "a<b>" })).find(r => r.label === "Rest").value, "30 W (ab)")
   const none = model.breakdown(null)
   const get = label => none.find(r => r.label === label).value
   assert.strictEqual(get("Charging"), "No")
@@ -313,16 +323,80 @@ test("wording: rest source as the CLI prints it, sentence-case unknowns", () => 
 
 test("cap status: PL1, GPU against max, no invented max, unknowns", () => {
   const base = model.parseCurrent(JSON.stringify(sample({ gpu_max_limit_w: 190 }))).data
-  assert.deepStrictEqual(model.capStatus(base), { cpu: "PL1 91 W", gpu: "190 W (max, uncapped)", gpuCapped: false })
+  assert.deepStrictEqual(model.capStatus(base), { cpu: "PL1 91 W", gpu: "190 W (max, uncapped)", gpuCapped: false,
+    cpuCapped: false, cpuReverted: false })
   const capped = model.parseCurrent(JSON.stringify(sample({ gpu_limit_w: 80, cpu_limit_w: 45, gpu_max_limit_w: 190 }))).data
-  assert.deepStrictEqual(model.capStatus(capped), { cpu: "PL1 45 W", gpu: "80 W of 190 W (capped)", gpuCapped: true })
+  assert.deepStrictEqual(model.capStatus(capped), { cpu: "PL1 45 W", gpu: "80 W of 190 W (capped)", gpuCapped: true,
+    cpuCapped: false, cpuReverted: false })
   // No maximum reported: the limit as is, never measured against a made-up one.
   const noMax = model.parseCurrent(JSON.stringify(sample({ gpu_limit_w: 80 }))).data
-  assert.deepStrictEqual(model.capStatus(noMax), { cpu: "PL1 91 W", gpu: "80 W (max unknown)", gpuCapped: false })
+  assert.deepStrictEqual(model.capStatus(noMax), { cpu: "PL1 91 W", gpu: "80 W (max unknown)", gpuCapped: false,
+    cpuCapped: false, cpuReverted: false })
   const withMax = model.parseCurrent(JSON.stringify(sample({ gpu_limit_w: 150, gpu_max_limit_w: 200 }))).data
   assert.strictEqual(model.capStatus(withMax).gpu, "150 W of 200 W (capped)")
   const none = model.parseCurrent(JSON.stringify(sample({ gpu_limit_w: null, cpu_limit_w: null }))).data
-  assert.deepStrictEqual(model.capStatus(none), { cpu: "Unknown", gpu: "Unknown", gpuCapped: false })
+  assert.deepStrictEqual(model.capStatus(none), { cpu: "Unknown", gpu: "Unknown", gpuCapped: false,
+    cpuCapped: false, cpuReverted: false })
+})
+
+test("CPU cap state: capped, uncapped, reverted, and an older service without the keys", () => {
+  const cpu = over => model.capStatus(parsed(over))
+  const capped = cpu({ cpu_cap: "capped", cpu_cap_w: 45, cpu_limit_w: 45 })
+  assert.strictEqual(capped.cpu, "PL1 45 W (capped)")
+  assert.strictEqual(capped.cpuCapped, true)
+  assert.strictEqual(capped.cpuReverted, false)
+  const uncapped = cpu({ cpu_cap: "uncapped", cpu_cap_w: null })
+  assert.strictEqual(uncapped.cpu, "PL1 91 W (uncapped)")
+  assert.strictEqual(uncapped.cpuCapped, false)
+  assert.strictEqual(uncapped.cpuReverted, false)
+  const reverted = cpu({ cpu_cap: "reverted", cpu_cap_w: 45 })
+  assert.strictEqual(reverted.cpu, "PL1 91 W (45 W cap reverted)")
+  assert.strictEqual(reverted.cpuReverted, true)
+  assert.strictEqual(reverted.cpuCapped, false)
+  assert.strictEqual(cpu({ cpu_cap: "reverted", cpu_cap_w: null }).cpu, "PL1 91 W (cap reverted)")
+  assert.strictEqual(cpu({ cpu_cap: "reverted" }).cpu, "PL1 91 W (cap reverted)")
+  // A 0 W cap is not a usable figure: no "0 W cap reverted".
+  assert.strictEqual(cpu({ cpu_cap: "reverted", cpu_cap_w: 0 }).cpu, "PL1 91 W (cap reverted)")
+  assert.strictEqual(cpu({ cpu_cap: "reverted", cpu_cap_w: 0.4 }).cpu, "PL1 91 W (" + model.formatWatts(0.4) + " cap reverted)")
+  // Reverted is something other than power-watch undoing the cap; the notes
+  // say so, once, and only for reverted.
+  const note = "CPU cap reverted by something else; see power-cap status."
+  assert.strictEqual(model.sampleNotes(parsed({ cpu_cap: "reverted", cpu_cap_w: 45 })), note)
+  assert.strictEqual(model.sampleNotes(parsed({ cpu_cap: "reverted" })), note)
+  for (const state of ["capped", "uncapped", null, "bogus"])
+    assert.ok(!/reverted/.test(model.sampleNotes(parsed({ cpu_cap: state, cpu_cap_w: 45 }))), String(state))
+  assert.ok(model.sampleNotes(parsed({ cpu_cap: "reverted", errors: ["x"] })).endsWith(" " + note), "after the other notes")
+  // cpu_cap null, and an older service that writes neither key: today's text.
+  assert.deepStrictEqual(cpu({ cpu_cap: null, cpu_cap_w: null }), cpu({}))
+  const old = sample()
+  assert.ok(!("cpu_cap" in old) && !("cpu_cap_w" in old), "the base sample is an older service's")
+  const plain = model.capStatus(model.parseCurrent(JSON.stringify(old)).data)
+  assert.strictEqual(plain.cpu, "PL1 91 W")
+  assert.strictEqual(plain.cpuCapped, false)
+  assert.strictEqual(plain.cpuReverted, false)
+  const c = parsed({ cpu_cap: "capped", cpu_cap_w: 45 })
+  assert.strictEqual(c.cpuCap, "capped")
+  assert.strictEqual(c.cpuCapW, 45)
+  assert.strictEqual(parsed().cpuCap, null)
+  assert.strictEqual(parsed().cpuCapW, null)
+  // No PL1 reported: the state still shows.
+  assert.strictEqual(cpu({ cpu_limit_w: null, cpu_cap: "capped" }).cpu, "Unknown (capped)")
+})
+
+test("CPU cap state: anything outside the enum, and a bad cap_w, read as not reported", () => {
+  for (const v of ["CAPPED", "capped ", "on", "", 1, true, {}, [], ["capped"], NaN]) {
+    const c = parsed({ cpu_cap: v, cpu_cap_w: 45 })
+    assert.strictEqual(c.cpuCap, null, JSON.stringify(v))
+    const caps = model.capStatus(c)
+    assert.strictEqual(caps.cpu, "PL1 91 W", JSON.stringify(v))
+    assert.strictEqual(caps.cpuCapped || caps.cpuReverted, false, JSON.stringify(v))
+  }
+  for (const w of ["45", -1, 1e300, NaN, true, {}, []]) {
+    const c = parsed({ cpu_cap: "reverted", cpu_cap_w: w })
+    assert.strictEqual(c.cpuCapW, null, JSON.stringify(w))
+    assert.strictEqual(model.capStatus(c).cpu, "PL1 91 W (cap reverted)", JSON.stringify(w))
+  }
+  assert.deepStrictEqual(model.CPU_CAP_STATES, ["capped", "uncapped", "reverted"])
 })
 
 // ------------------------------------------------ generic-config report keys
@@ -572,7 +646,7 @@ test("no shown string carries NaN, null or undefined, whatever the new keys hold
   const junk = [null, undefined, "x", NaN, {}, [], true, -1, 1e300]
   for (const v of junk) {
     const c = parsed({ total_source: v, total_lower_bound: v, psys_w: v, gpu_status: v, gpu_devices: v,
-      adapter_v: v, adapter_current_a: v, adapter_rating_w: v, total_w: v, gpu_w: v })
+      adapter_v: v, adapter_current_a: v, adapter_rating_w: v, total_w: v, gpu_w: v, cpu_cap: v, cpu_cap_w: v })
     const texts = [model.barText(c, false), model.barLines(c, false).join(" "),
       model.tooltipText(c, false), model.statusLine(c), model.sampleNotes(c),
       model.currentStatText(model.stats([], c, false), c, false),
@@ -903,6 +977,249 @@ test("Max, CPU and GPU differ by pattern or weight, not only colour", () => {
   assert.ok(st.cpuWidth > st.maxWidth && st.gpuWidth > st.maxWidth)
 })
 
+// ------------------------------------------------------------- series colours
+
+// An independent reference for the checks, written from the dataviz palette
+// validator's formulas (OKLab delta E x100, Machado 2009 protan/deutan at
+// severity 1, WCAG contrast): the assertions do not trust Model's own maths.
+const ref = (() => {
+  const lin = c => [c.r, c.g, c.b].map(v => v <= 0.04045 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4))
+  const lab = ([r, g, b]) => {
+    const l = Math.cbrt(0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b)
+    const m = Math.cbrt(0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b)
+    const s = Math.cbrt(0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b)
+    return [0.2104542553 * l + 0.7936177850 * m - 0.0040720468 * s,
+      1.9779984951 * l - 2.4285922050 * m + 0.4505937099 * s,
+      0.0259040371 * l + 0.7827717662 * m - 0.8086757660 * s]
+  }
+  const sims = {
+    protan: [[0.152286, 1.052583, -0.204868], [0.114503, 0.786281, 0.099216], [-0.003882, -0.048116, 1.051998]],
+    deutan: [[0.367322, 0.860646, -0.227968], [0.280085, 0.672501, 0.047413], [-0.011820, 0.042940, 0.968881]]
+  }
+  const clamp = v => Math.max(0, Math.min(1, v))
+  const sim = (c, M) => { const v = lin(c); return M.map(row => clamp(row[0] * v[0] + row[1] * v[1] + row[2] * v[2])) }
+  const dist = (p, q) => 100 * Math.hypot(p[0] - q[0], p[1] - q[1], p[2] - q[2])
+  const lum = c => { const v = lin(c); return 0.2126 * v[0] + 0.7152 * v[1] + 0.0722 * v[2] }
+  return {
+    hex: h => ({ r: parseInt(h.slice(1, 3), 16) / 255, g: parseInt(h.slice(3, 5), 16) / 255, b: parseInt(h.slice(5, 7), 16) / 255 }),
+    toHex: c => "#" + [c.r, c.g, c.b].map(v => Math.round(v * 255).toString(16).padStart(2, "0")).join(""),
+    normal: (a, b) => dist(lab(lin(a)), lab(lin(b))),
+    cvd: (a, b) => Math.min(dist(lab(sim(a, sims.protan)), lab(sim(b, sims.protan))),
+      dist(lab(sim(a, sims.deutan)), lab(sim(b, sims.deutan)))),
+    contrast: (a, b) => { const x = lum(a), y = lum(b); return (Math.max(x, y) + 0.05) / (Math.min(x, y) + 0.05) },
+    lch: c => { const [L, a, b] = lab(lin(c)); return { L, C: Math.hypot(a, b), h: (Math.atan2(b, a) * 180 / Math.PI + 360) % 360 } },
+    hueGap: (a, b) => { const d = Math.abs(a - b) % 360; return d > 180 ? 360 - d : d },
+    lum
+  }
+})()
+
+// Theme colours as the shell reads them (Commons/Color.qml loadColors:
+// accent, else color4; urgent = color1), copied from the stock themes and the
+// theme current at the time of writing; the panel background is the theme's.
+const THEMES = {
+  "current (custom)": { accent: "#9b826b", foreground: "#f0e9ec", background: "#1e2125", urgent: "#976870" },
+  "solitude (grey)": { accent: "#798186", foreground: "#cacccc", background: "#101315", urgent: "#565d60" },
+  "vantablack (grey)": { accent: "#8d8d8d", foreground: "#ffffff", background: "#000000", urgent: "#a4a4a4" },
+  "white (grey, light)": { accent: "#6e6e6e", foreground: "#000000", background: "#ffffff", urgent: "#2a2a2a" },
+  "lupine (magenta urgent, light)": { accent: "#3264eb", foreground: "#212121", background: "#fafafa", urgent: "#c900c4" },
+  "shell defaults (accent = foreground)": { accent: "#cacccc", foreground: "#cacccc", background: "#101315", urgent: "#a55555" },
+  "kanagawa (accent = foreground)": { accent: "#dcd7ba", foreground: "#dcd7ba", background: "#1f1f28", urgent: "#c34043" },
+  "catppuccin": { accent: "#89b4fa", foreground: "#cdd6f4", background: "#1e1e2e", urgent: "#f38ba8" },
+  "nord": { accent: "#81a1c1", foreground: "#d8dee9", background: "#2e3440", urgent: "#bf616a" },
+  "hackerman (accent hue = urgent hue)": { accent: "#82FB9C", foreground: "#ddf7ff", background: "#0B0C16", urgent: "#50f872" },
+  "lumon (blue urgent)": { accent: "#8bc9eb", foreground: "#d6e2ee", background: "#16242d", urgent: "#4d86b0" },
+  "catppuccin-latte (light)": { accent: "#1e66f5", foreground: "#4c4f69", background: "#eff1f5", urgent: "#d20f39" },
+  "flexoki-light (light)": { accent: "#205EA6", foreground: "#100F0F", background: "#FFFCF0", urgent: "#D14D41" },
+  "rose-pine (light)": { accent: "#56949f", foreground: "#575279", background: "#faf4ed", urgent: "#b4637a" }
+}
+const themeColors = t => {
+  const h = {}
+  for (const k of Object.keys(t)) h[k] = ref.hex(t[k])
+  return model.seriesColors(h.accent, h.foreground, h.background, h.urgent)
+}
+
+test("series colours: three distinct hues in every fixture theme, for normal and CVD vision", () => {
+  for (const [name, t] of Object.entries(THEMES)) {
+    const s = themeColors(t)
+    const triple = [["CPU", s.cpu], ["GPU", s.gpu], ["Battery", s.battery]]
+    for (let i = 0; i < 3; i++) {
+      for (let j = i + 1; j < 3; j++) {
+        const what = name + ": " + triple[i][0] + " " + ref.toHex(triple[i][1]) + " vs " + triple[j][0] + " " + ref.toHex(triple[j][1])
+        assert.ok(ref.normal(triple[i][1], triple[j][1]) >= 15, what + " normal ΔE " + ref.normal(triple[i][1], triple[j][1]).toFixed(1))
+        assert.ok(ref.cvd(triple[i][1], triple[j][1]) >= 8, what + " CVD ΔE " + ref.cvd(triple[i][1], triple[j][1]).toFixed(1))
+      }
+    }
+  }
+})
+
+test("series colours: contrast, lightness band and chroma floor, dark and light themes", () => {
+  let light = 0
+  for (const [name, t] of Object.entries(THEMES)) {
+    const s = themeColors(t)
+    const bg = ref.hex(t.background)
+    // Dark when white contrasts more with the panel than black does.
+    const dark = ref.contrast(bg, ref.hex("#ffffff")) >= ref.contrast(bg, ref.hex("#000000"))
+    assert.strictEqual(s.dark, dark, name)
+    if (!dark) light++
+    const band = dark ? [0.48, 0.67] : [0.43, 0.77]
+    for (const key of ["cpu", "gpu", "battery"]) {
+      const c = s[key]
+      const what = name + " " + key + " " + ref.toHex(c)
+      for (const v of [c.r, c.g, c.b]) assert.ok(Number.isInteger(Math.round(v * 255)) && Math.abs(v * 255 - Math.round(v * 255)) < 1e-9, what + " is 8-bit")
+      assert.ok(ref.contrast(c, bg) >= 3, what + " contrast " + ref.contrast(c, bg).toFixed(2))
+      const lch = ref.lch(c)
+      assert.ok(lch.L >= band[0] && lch.L <= band[1], what + " L " + lch.L.toFixed(3))
+      assert.ok(lch.C >= 0.10, what + " C " + lch.C.toFixed(3))
+    }
+  }
+  assert.ok(light >= 3, "the fixtures cover light themes")
+})
+
+test("series colours: kept off urgent's hue, CPU on the accent's", () => {
+  // Pinned here, not read back: the threshold line's hue keeps 35° clear.
+  const gap = 35
+  assert.strictEqual(model.SERIES_COLOR.urgentGap, gap)
+  for (const [name, t] of Object.entries(THEMES)) {
+    const s = themeColors(t)
+    const u = ref.lch(ref.hex(t.urgent))
+    const a = ref.lch(ref.hex(t.accent))
+    // 8-bit rounding moves a hue by a degree or two; the gap is on the
+    // unrounded colour.
+    if (u.C >= model.SERIES_COLOR.greyChroma) {
+      for (const key of ["cpu", "gpu", "battery"])
+        assert.ok(ref.hueGap(ref.lch(s[key]).h, u.h) >= gap - 2, name + " " + key + " hue " + ref.lch(s[key]).h.toFixed(0) + " vs urgent " + u.h.toFixed(0))
+    }
+    const anchored = a.C >= model.SERIES_COLOR.greyChroma && (u.C < model.SERIES_COLOR.greyChroma || ref.hueGap(a.h, u.h) >= gap)
+    if (anchored) assert.ok(ref.hueGap(ref.lch(s.cpu).h, a.h) <= 3, name + " CPU hue " + ref.lch(s.cpu).h.toFixed(0) + " vs accent " + a.h.toFixed(0))
+  }
+  // An accent on urgent's hue is moved just past the gap, not dropped.
+  const hk = THEMES["hackerman (accent hue = urgent hue)"]
+  const cpuHue = ref.lch(themeColors(hk).cpu).h
+  const off = ref.hueGap(cpuHue, ref.lch(ref.hex(hk.urgent)).h)
+  assert.ok(off >= gap - 2 && off <= gap + 5, "hackerman CPU hue " + cpuHue.toFixed(0) + " is " + off.toFixed(0) + "° off urgent")
+})
+
+// The red band, pinned here and not read back: OKLCH hue 345-45 inclusive.
+const inRedBand = h => h >= 345 || h <= 45
+
+test("series colours: no series hue in the red band, whatever urgent is", () => {
+  assert.deepStrictEqual(model.SERIES_COLOR.redBand, [345, 45])
+  // Grey urgent (no gap to keep red out) and lupine's magenta urgent: before,
+  // GPU came out #942318, #ae3b43, #9c356e and brick #932506.
+  for (const name of ["white (grey, light)", "solitude (grey)", "vantablack (grey)", "lupine (magenta urgent, light)"])
+    assert.ok(THEMES[name], name)
+  for (const [name, t] of Object.entries(THEMES)) {
+    const s = themeColors(t)
+    for (const key of ["cpu", "gpu", "battery"]) {
+      const h = ref.lch(s[key]).h
+      assert.ok(!inRedBand(h), name + " " + key + " " + ref.toHex(s[key]) + " hue " + h.toFixed(1) + " is in the red band")
+    }
+  }
+  // An accent inside the band: CPU leaves it, the other two stay out too.
+  for (const accent of ["#ff0000", "#c7768e", "#b59790", "#9c356e", "#a83e06"]) {
+    for (const [bg, fg] of [["#101315", "#cacccc"], ["#ffffff", "#000000"]]) {
+      const s = model.seriesColors(ref.hex(accent), ref.hex(fg), ref.hex(bg), ref.hex("#808080"))
+      for (const key of ["cpu", "gpu", "battery"]) {
+        const h = ref.lch(s[key]).h
+        assert.ok(!inRedBand(h), accent + " on " + bg + " " + key + " hue " + h.toFixed(1))
+        assert.ok(ref.contrast(s[key], ref.hex(bg)) >= 3, accent + " on " + bg + " " + key)
+      }
+    }
+  }
+})
+
+test("series colours: light or dark from the panel background alone, 3:1 even when fg equals bg", () => {
+  const grey = v => ({ r: v, g: v, b: v })
+  const cases = [
+    // [what, accent, foreground, background, urgent, expected dark]
+    ["fg == bg, white", ref.hex("#6e6e6e"), grey(1), grey(1), ref.hex("#2a2a2a"), false],
+    ["fg == bg, black", ref.hex("#8d8d8d"), grey(0), grey(0), ref.hex("#a4a4a4"), true],
+    ["fg == bg == accent == urgent, mid grey", grey(0.5), grey(0.5), grey(0.5), grey(0.5), false],
+    ["white text on a 0.95 grey panel", ref.hex("#89b4fa"), grey(1), grey(0.95), ref.hex("#f38ba8"), false],
+    ["black text on a 0.1 grey panel", ref.hex("#1e66f5"), grey(0), grey(0.1), ref.hex("#d20f39"), true],
+    // Either side of the crossover (luminance ~0.18, sRGB grey ~0.46)
+    ["panel just darker than the crossover", grey(0.46), grey(1), grey(0.46), ref.hex("#ff0000"), true],
+    ["panel just lighter than the crossover", grey(0.47), grey(0), grey(0.47), ref.hex("#ff0000"), false]
+  ]
+  for (const [what, accent, fg, bg, urgent, dark] of cases) {
+    const s = model.seriesColors(accent, fg, bg, urgent)
+    assert.strictEqual(s.dark, dark, what)
+    for (const key of ["cpu", "gpu", "battery"])
+      assert.ok(ref.contrast(s[key], bg) >= 3, what + ": " + key + " " + ref.toHex(s[key]) + " " + ref.contrast(s[key], bg).toFixed(2) + ":1")
+    // The foreground plays no part in the decision.
+    assert.deepStrictEqual(model.seriesColors(accent, grey(1), bg, urgent).dark, dark, what)
+    assert.deepStrictEqual(model.seriesColors(accent, grey(0), bg, urgent).dark, dark, what)
+  }
+})
+
+test("series colours: a fully transparent input counts as missing, other alpha is ignored", () => {
+  const t = THEMES["catppuccin"]
+  const h = {}
+  for (const k of Object.keys(t)) h[k] = ref.hex(t[k])
+  const clear = c => Object.assign({}, c, { a: 0 })
+  const half = c => Object.assign({}, c, { a: 0.5 })
+  const base = model.seriesColors(h.accent, h.foreground, h.background, h.urgent)
+  // Translucent: taken as opaque.
+  assert.deepStrictEqual(model.seriesColors(half(h.accent), half(h.foreground), half(h.background), half(h.urgent)), base)
+  // Transparent: as if not given (accent falls back to the foreground, the
+  // background to black, urgent to its stand-in).
+  assert.deepStrictEqual(model.seriesColors(clear(h.accent), h.foreground, h.background, h.urgent),
+    model.seriesColors(undefined, h.foreground, h.background, h.urgent))
+  assert.deepStrictEqual(model.seriesColors(h.accent, h.foreground, clear(h.background), h.urgent),
+    model.seriesColors(h.accent, h.foreground, undefined, h.urgent))
+  assert.deepStrictEqual(model.seriesColors(h.accent, h.foreground, h.background, clear(h.urgent)),
+    model.seriesColors(h.accent, h.foreground, h.background, undefined))
+  const c = model.chartColors(h.accent, clear(h.foreground), h.background, clear(h.urgent))
+  assert.deepStrictEqual([c.average.r, c.average.g, c.average.b], [1, 1, 1], "a dark panel's stand-in ink is white")
+  assert.ok(c.threshold.r > 0 && c.threshold.a === 1, "urgent's stand-in is opaque")
+  const light = model.chartColors(h.accent, clear(h.foreground), ref.hex("#fafafa"), h.urgent)
+  assert.deepStrictEqual([light.average.r, light.average.g, light.average.b], [0, 0, 0], "a light panel's is black")
+})
+
+test("series colours: deterministic, and junk input still yields three valid colours", () => {
+  const t = THEMES["current (custom)"]
+  assert.deepStrictEqual(themeColors(t), themeColors(t))
+  const black = { r: 0, g: 0, b: 0 }
+  const cases = [[undefined, undefined, undefined, undefined], [null, {}, "x", 3],
+    [{ r: NaN, g: 0, b: 0 }, { r: 2, g: -1, b: Infinity }, black, black],
+    [black, black, black, black], [ref.hex("#808080"), ref.hex("#ffffff"), ref.hex("#808080"), ref.hex("#ff0000")]]
+  for (const args of cases) {
+    const s = model.seriesColors.apply(null, args)
+    for (const key of ["cpu", "gpu", "battery"]) {
+      for (const v of [s[key].r, s[key].g, s[key].b])
+        assert.ok(typeof v === "number" && v >= 0 && v <= 1, JSON.stringify(args) + " " + key)
+    }
+    assert.notDeepStrictEqual(s.cpu, s.gpu)
+    assert.notDeepStrictEqual(s.gpu, s.battery)
+  }
+})
+
+test("chart colours: series from seriesColors, Mixed from Battery, the rest foreground and urgent", () => {
+  const t = THEMES["current (custom)"]
+  const fg = ref.hex(t.foreground)
+  const urg = ref.hex(t.urgent)
+  const args = [ref.hex(t.accent), fg, ref.hex(t.background), urg]
+  const s = model.seriesColors.apply(null, args)
+  const c = model.chartColors.apply(null, args)
+  const st = model.CHART_STYLE
+  const rgb = x => [x.r, x.g, x.b]
+  assert.deepStrictEqual(rgb(c.cpu), rgb(s.cpu))
+  assert.deepStrictEqual(rgb(c.gpu), rgb(s.gpu))
+  assert.deepStrictEqual(rgb(c.battery), rgb(s.battery))
+  assert.deepStrictEqual(rgb(c.mixed), rgb(s.battery), "Mixed derives from Battery")
+  assert.deepStrictEqual(rgb(c.batteryShade), rgb(s.battery))
+  for (const key of ["average", "averageLine", "max", "ac", "acMeasured", "unknown"])
+    assert.deepStrictEqual(rgb(c[key]), rgb(fg), key + " is foreground-based")
+  assert.deepStrictEqual(rgb(c.threshold), rgb(urg))
+  assert.strictEqual(c.cpu.a, 1)
+  assert.strictEqual(c.gpu.a, 1, "GPU is opaque: its contrast is the guaranteed one")
+  assert.strictEqual(c.mixed.a, st.mixedAlpha)
+  assert.strictEqual(c.battery.a, st.batteryAlpha)
+  assert.ok(c.mixed.a < c.battery.a, "Mixed is the Battery colour at a lower alpha")
+  assert.strictEqual(c.ac.a, st.acAlpha)
+  assert.strictEqual(c.acMeasured.a, st.acMeasuredAlpha)
+})
+
 test("layout of an empty range says so", () => {
   const m = model.chartModel([], "7d", 1761300000, 2, 150)
   const lay = model.chartLayout(m, 600, 200)
@@ -926,6 +1243,11 @@ test("ranges map to tiers and files; state dir honours the env override", () => 
   assert.deepStrictEqual(model.RANGES.map(r => [r.key, r.tier, r.file]), [
     ["1h", "raw", "history-raw.jsonl"], ["24h", "1m", "history-1m.jsonl"], ["7d", "15m", "history-15m.jsonl"]])
   assert.strictEqual(model.rangeFor("bogus").key, "1h")
+  // History reload interval per range: the raw tier is followed every 5 s,
+  // the minute and 15-minute tiers once a minute.
+  assert.deepStrictEqual(model.RANGES.map(r => [r.key, r.refreshMs]), [["1h", 5000], ["24h", 60000], ["7d", 60000]])
+  assert.strictEqual(model.rangeFor("24h").refreshMs, 60000)
+  assert.strictEqual(model.rangeFor("bogus").refreshMs, 5000)
   assert.strictEqual(model.stepFor("1h", 2.5), 2.5)
   assert.strictEqual(model.stepFor("1h", null), 2)
   assert.strictEqual(model.stepFor("7d", 2), 900)
@@ -1059,7 +1381,15 @@ test("history is only watched and read while the panel is open", () => {
   const qml = qmlCode("BarWidget.qml")
   assert.ok(/id:\s*historyLoader[\s\S]{0,200}active:\s*root\.opened/.test(qml),
     "the history reader lives in a Loader gated on root.opened")
-  assert.ok(/minIntervalMs:\s*Model\.HISTORY_THROTTLE_MS/.test(qml), "history reads are throttled")
+  assert.ok(/minIntervalMs:\s*Model\.rangeFor\(root\.range\)\.refreshMs/.test(qml), "history reads are throttled per range")
+  // A range switch changes the file name, and a new name restarts the gate,
+  // which stops the throttle first: the new range is read at once, never
+  // after the old range's (longer) window. Opening the panel creates the gate.
+  const gate = qmlCode("GatedFile.qml")
+  assert.ok(/onNameChanged:\s*if \(gate\.ready\) Qt\.callLater\(gate\.restart\)/.test(gate))
+  assert.ok(/function restart\(\) \{\s*throttle\.stop\(\)/.test(gate), "restart() stops the read window first")
+  assert.ok(/interval:\s*Math\.max\(1, gate\.minIntervalMs\)/.test(gate), "the window follows minIntervalMs")
+  assert.strictEqual(new Set(model.RANGES.map(r => r.file)).size, model.RANGES.length, "each range has its own file")
   const loader = qml.slice(qml.indexOf("id: historyLoader"))
   assert.ok(/GatedFile\s*\{[\s\S]*?maxBytes:\s*Model\.HISTORY_MAX_BYTES/.test(loader), "history goes through the read gate")
 })
@@ -1098,6 +1428,24 @@ test("every file read goes through the size gate: FileView only in GatedFile.qml
 test("chart and legend share one style, and the chart's sizes are scaled", () => {
   const chart = qmlCode("Chart.qml")
   assert.ok(/Model\.CHART_STYLE/.test(chart) && /Model\.CHART_STYLE/.test(qmlCode("BarWidget.qml")))
+  // Colours: derived once (BarWidget's chartColors), handed to the chart, and
+  // read by every legend swatch; neither draws the accent or rebuilds a colour.
+  const bar = qmlCode("BarWidget.qml")
+  const calls = qmlFiles.reduce((n, f) => n + (qmlCode(f).match(/Model\.chartColors\(/g) || []).length, 0)
+  assert.strictEqual(calls, 1, "chartColors is computed in one place")
+  // Only while the panel is open, and from Commons.Color's values, which do
+  // not animate (the bar's urgent does, for 420 ms on a theme switch).
+  const binding = (bar.match(/readonly property var chartColors:[\s\S]*?: null/) || [""])[0]
+  assert.ok(/^readonly property var chartColors:\s*root\.opened\s*\?\s*Model\.chartColors\(/.test(binding), binding)
+  assert.ok(/Model\.chartColors\(Commons\.Color\.accent, Commons\.Color\.bar\.text, Commons\.Color\.popups\.background,\s*Commons\.Color\.bar\.active\)/.test(binding), binding)
+  assert.ok(!/root\.(urgent|foreground|accent|bar)\b/.test(binding), "no bar-animated input: " + binding)
+  assert.ok(/function chartColor\(key\) \{\s*var c = root\.chartColors \? root\.chartColors\[key\] : null/.test(bar),
+    "the legend copes with chartColors being null while the panel is closed")
+  assert.ok(/colors:\s*root\.chartColors/.test(bar), "the chart gets the shared colours")
+  assert.ok(!/root\.accent|Qt\.rgba/.test(chart), "Chart.qml paints only the colours it is handed")
+  const legends = bar.match(/LegendItem \{[^\n]*swatchColor:[^;\n]*/g) || []
+  assert.ok(legends.length >= 9, legends.length + " legend swatches")
+  for (const item of legends) assert.ok(/swatchColor:\s*root\.chartColor\("\w+"\)/.test(item), item)
   assert.ok(/ctx\.font\s*=\s*Model\.canvasFont\(/.test(chart), "the Canvas font string is built by canvasFont")
   assert.ok(/Model\.clampLabelX\(/.test(chart), "time labels are clamped by their measured width")
   // no bare numeric dash patterns or label clamps left in the paint code
@@ -1118,8 +1466,16 @@ test("stale data is dimmed with opacity and the panel scrolls", () => {
 
 test("every band mode the model produces has a colour in the chart", () => {
   const chart = qmlCode("Chart.qml")
-  for (const mode of ["battery", "mixed", "acMeasured", "ac"])
-    assert.ok(new RegExp('mode === "' + mode + '"').test(chart), "Chart.qml spanColor lacks " + mode)
+  assert.ok(/Model\.bandColor\(col, mode\)/.test(chart), "Chart.qml colours bands through Model.bandColor")
+  const colors = model.chartColors({ r: 0.6, g: 0.5, b: 0.4 }, { r: 0.94, g: 0.91, b: 0.93 }, { r: 0.12, g: 0.13, b: 0.15 },
+    { r: 0.6, g: 0.4, b: 0.44 })
+  for (const mode of ["battery", "mixed", "acMeasured", "ac"]) {
+    assert.ok(model.BAND_MODES.includes(mode), mode)
+    assert.strictEqual(model.bandColor(colors, mode), colors[mode], mode)
+    assert.notStrictEqual(colors[mode], colors.unknown, mode)
+  }
+  assert.strictEqual(model.bandColor(colors, "unknown"), colors.unknown)
+  assert.strictEqual(model.bandColor(colors, "toString"), colors.unknown)
   const bar = qmlCode("BarWidget.qml")
   assert.ok(/visible:\s*Model\.showsMeasuredAc\(root\.chart, root\.current\);\s*label:\s*Model\.PSYS_BAND_LABEL/.test(bar))
   assert.ok(/id:\s*widest[\s\S]{0,200}text:\s*Model\.BAR_WIDEST_TEXT\s*$/m.test(bar),
@@ -1137,7 +1493,7 @@ test("no machine-specific wording or figures in the plugin", () => {
     assert.ok(!/\b(190|330|19\.5)\b|GTX|1080|Raul's/.test(text.replace(/"author":[^\n]*/, "")), file)
   }
   const manifest = JSON.parse(fs.readFileSync(path.join(pluginDir, "manifest.json"), "utf8"))
-  assert.strictEqual(manifest.version, "1.1.0")
+  assert.ok(/^\d+\.\d+\.\d+$/.test(manifest.version), "semver: " + manifest.version)
   assert.ok(/Estimated or measured/.test(manifest.description), manifest.description)
 })
 

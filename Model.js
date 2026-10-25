@@ -29,6 +29,9 @@ var TOTAL_SOURCES = ["battery", "psys", "model"]
 var GPU_STATUSES = ["active", "suspended", "none", "disabled", "unknown"]
 var GPU_DEVICE_STATUSES = ["active", "suspended", "unknown"]
 var GPU_VENDORS = ["nvidia", "amd"]
+// cpu_cap: the service's CPU power-cap state, an optional key (older services
+// do not write it, and it then reads as null: plain "PL1 N W").
+var CPU_CAP_STATES = ["capped", "uncapped", "reverted"]
 
 // At most this many gpu_devices entries are kept; the rest are counted, and
 // the GPU row says the list was cut ("16 of 20 GPUs listed").
@@ -70,9 +73,12 @@ var STALE_CHECK_MS = 10000
 // window: the bar lags the file by at most this, and isStale allows for it.
 var CURRENT_READ_MIN_MS = 1000
 
-// Minimum gap between two history reloads while the panel is open. The raw
-// tier is appended every ~2 s; the chart follows it at most this often.
-var HISTORY_THROTTLE_MS = 5000
+// Minimum gap between two history reloads while the panel is open, per range:
+// RANGES[].refreshMs (read through rangeFor). The raw tier is appended every
+// ~2 s and the 1h chart follows it at most every 5 s; the 1m and 15m tiers
+// change once a minute or less, and a full tier costs ~0.3 s to parse, so 24h
+// and 7d reload at most once a minute. No range reloads faster than this floor.
+var HISTORY_MIN_REFRESH_MS = 5000
 
 // A run of consecutive points further apart than this many steps is a gap:
 // drawn as a break, never interpolated (contract "Readers").
@@ -107,9 +113,9 @@ var MAX_RENDER_POINTS = 1500
 var MAX_ABS_VALUE = 100000
 
 var RANGES = [
-  { key: "1h", label: "1h", tier: "raw", file: "history-raw.jsonl", span: 3600, step: 0 },
-  { key: "24h", label: "24h", tier: "1m", file: "history-1m.jsonl", span: 86400, step: 60 },
-  { key: "7d", label: "7d", tier: "15m", file: "history-15m.jsonl", span: 604800, step: 900 }
+  { key: "1h", label: "1h", tier: "raw", file: "history-raw.jsonl", span: 3600, step: 0, refreshMs: 5000 },
+  { key: "24h", label: "24h", tier: "1m", file: "history-1m.jsonl", span: 86400, step: 60, refreshMs: 60000 },
+  { key: "7d", label: "7d", tier: "15m", file: "history-15m.jsonl", span: 604800, step: 900, refreshMs: 60000 }
 ]
 
 // ------------------------------------------------------------ small helpers
@@ -282,6 +288,9 @@ function parseCurrent(text) {
       adapterRatingInvalid: ratingW === null && obj.adapter_rating_w !== null && obj.adapter_rating_w !== undefined,
       thresholdW: threshold === null ? DEFAULT_THRESHOLD_W : threshold,
       cpuLimitW: finiteIn(obj.cpu_limit_w, 0, MAX_ABS_VALUE),
+      // Optional (newer services): the cap state, and the PL1 cap it applied.
+      cpuCap: oneOf(obj.cpu_cap, CPU_CAP_STATES) || null,
+      cpuCapW: finiteIn(obj.cpu_cap_w, 0, MAX_ABS_VALUE),
       gpuLimitW: finiteIn(obj.gpu_limit_w, 0, MAX_ABS_VALUE),
       gpuMaxLimitW: finiteIn(obj.gpu_max_limit_w, 0, MAX_ABS_VALUE),
       gpuPstate: safeLabel(obj.gpu_pstate, 8),
@@ -439,11 +448,15 @@ function statusLine(current) {
   return totalLabel(c) + " · " + powerSourceLabel(c.acOnline) + (words ? " · " + words : "")
 }
 
-// The rest-of-system source, worded as `power-watch` prints it.
+// The rest-of-system source in words. rest_source names how the figure was
+// obtained ("calibrate", "passive", "default"); any other (already sanitised)
+// value is shown as it is.
+var REST_SOURCE_WORDS = { calibrate: "calibrated", passive: "passively calibrated" }
+
 function restSourceLabel(source) {
   if (!source) return ""
   if (source === "default") return "DEFAULT — run power-watch calibrate"
-  return source + " calibration"
+  return REST_SOURCE_WORDS.hasOwnProperty(source) ? REST_SOURCE_WORDS[source] : source
 }
 
 function kindLabel(totalKind) {
@@ -591,15 +604,30 @@ function sampleNotes(current) {
   else if (current.incomplete) notes.push("Estimate incomplete: unknown terms counted as 0 W.")
   if (current.restSource === "default") notes.push("Rest: " + restSourceLabel("default") + ".")
   if (current.errorCount > 0) notes.push(current.errorCount + " sensor error(s); see power-watch --once.")
+  if (current.cpuCap === "reverted") notes.push(CPU_CAP_REVERTED_NOTE)
   return notes.join(" ")
 }
 
 // CPU PL1, and the GPU limit against its maximum. Without a reported maximum
 // the limit is shown as is: whether it is capped cannot be told. Without a
 // limit, a GPU that is suspended, absent or off says so.
+// The CPU cap state (cpu_cap, newer services) follows PL1 in brackets; a
+// service that does not report it gets plain "PL1 N W". "reverted" means
+// something other than power-watch put PL1 back after power-watch capped it:
+// "PL1 91 W (45 W cap reverted)" names the cap that was undone (cpu_cap_w)
+// when it is a usable figure (above 0 W), "(cap reverted)" otherwise, and
+// sampleNotes adds CPU_CAP_REVERTED_NOTE.
+var CPU_CAP_REVERTED_NOTE = "CPU cap reverted by something else; see power-cap status."
+
 function capStatus(current) {
   var c = current || {}
   var cpu = typeof c.cpuLimitW === "number" ? "PL1 " + formatWatts(c.cpuLimitW) : "Unknown"
+  var cpuCapped = c.cpuCap === "capped"
+  var cpuReverted = c.cpuCap === "reverted"
+  if (cpuCapped) cpu += " (capped)"
+  else if (c.cpuCap === "uncapped") cpu += " (uncapped)"
+  else if (cpuReverted)
+    cpu += typeof c.cpuCapW === "number" && c.cpuCapW > 0 ? " (" + formatWatts(c.cpuCapW) + " cap reverted)" : " (cap reverted)"
   var gpu = GPU_STATUS_WORDS[c.gpuStatus] || "Unknown"
   var gpuCapped = false
   if (typeof c.gpuLimitW === "number") {
@@ -609,7 +637,7 @@ function capStatus(current) {
       : gpuCapped ? formatWatts(c.gpuLimitW) + " of " + formatWatts(max) + " (capped)"
       : formatWatts(c.gpuLimitW) + " (max, uncapped)"
   }
-  return { cpu: cpu, gpu: gpu, gpuCapped: gpuCapped }
+  return { cpu: cpu, gpu: gpu, gpuCapped: gpuCapped, cpuCapped: cpuCapped, cpuReverted: cpuReverted }
 }
 
 // --------------------------------------------------------------- history
@@ -954,20 +982,392 @@ function chartModel(points, rangeKey, nowEpoch, intervalS, thresholdW) {
   }
 }
 
+// ----------------------------------------------------------------- colour
+
+// The chart's series colours, derived from the theme: the theme offers only
+// foreground, background, accent, urgent and muted, and in many themes the
+// accent is close to the foreground or to every other colour it has. CPU keeps
+// the accent's hue; GPU and Battery are hues rotated from it in OKLCH, chosen
+// to be as far apart as possible, for normal vision and under protan/deutan
+// simulation. Every colour has at least `chromaFloor` chroma (a grey accent
+// still yields three hues), a lightness inside the mode's band and at least
+// `minContrast` against the panel background in dark and light themes alike,
+// a hue at least `urgentGap` degrees from urgent, which the threshold line
+// wears, and a hue outside `redBand` whatever urgent is: red reads as the
+// alarm next to the threshold, and a grey urgent leaves no gap to keep it out.
+// Text never wears these: it stays foreground.
+// Bands and floors follow the dataviz palette checks (OKLCH L 0.48-0.67 dark,
+// 0.43-0.77 light, C >= 0.10, 3:1 for marks), inset slightly so the 8-bit
+// result still passes them.
+// redBand is OKLCH hue 345-45 degrees inclusive, wrapping through 0: from
+// raspberry (#9c356e, 350) through sRGB red (#ff0000, 29) to brick and rust
+// (#932506, 35; #a83e06, 42); orange (#b05100, 50) stays usable. The hue
+// judged is the drawn 8-bit colour's; an anchor moved out of a forbidden arc
+// lands `hueMargin` degrees clear of it, so rounding cannot bring it back.
+var SERIES_COLOR = {
+  darkBand: [0.49, 0.66],
+  lightBand: [0.44, 0.76],
+  minContrast: 3.1,
+  chroma: 0.15,
+  chromaFloor: 0.105,
+  greyChroma: 0.03,
+  fallbackHue: 250,
+  urgentGap: 35,
+  redBand: [345, 45],
+  hueMargin: 3,
+  hueStep: 10,
+  slots: 3
+}
+
+function srgbToLinear(c) {
+  return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4)
+}
+
+function linearToSrgb(c) {
+  return c <= 0.0031308 ? 12.92 * c : 1.055 * Math.pow(c, 1 / 2.4) - 0.055
+}
+
+function clamp01(v) {
+  return v < 0 ? 0 : v > 1 ? 1 : v
+}
+
+// Björn Ottosson's OKLab, from and to linear sRGB.
+function linearToOklab(r, g, b) {
+  var l = Math.cbrt(0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b)
+  var m = Math.cbrt(0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b)
+  var s = Math.cbrt(0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b)
+  return [0.2104542553 * l + 0.7936177850 * m - 0.0040720468 * s,
+    1.9779984951 * l - 2.4285922050 * m + 0.4505937099 * s,
+    0.0259040371 * l + 0.7827717662 * m - 0.8086757660 * s]
+}
+
+function oklabToLinear(L, a, b) {
+  var l = Math.pow(L + 0.3963377774 * a + 0.2158037573 * b, 3)
+  var m = Math.pow(L - 0.1055613458 * a - 0.0638541728 * b, 3)
+  var s = Math.pow(L - 0.0894841775 * a - 1.2914855480 * b, 3)
+  return [4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s,
+    -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,
+    -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s]
+}
+
+// A colour as { r, g, b } in 0..1 (what a QML color exposes), or `fallback`
+// when it is not one. A fully transparent colour (alpha 0, e.g. a "transparent"
+// role) is not one either: it has no colour to derive from. Any other alpha is
+// ignored and the colour taken as opaque, background included: what shows
+// through a translucent panel is not known here.
+function rgbIn(c, fallback) {
+  if (!c || typeof c !== "object") return fallback
+  var r = c.r, g = c.g, b = c.b
+  if (typeof r !== "number" || typeof g !== "number" || typeof b !== "number"
+    || !isFinite(r) || !isFinite(g) || !isFinite(b)) return fallback
+  if (typeof c.a === "number" && !(c.a > 0)) return fallback
+  return { r: clamp01(r), g: clamp01(g), b: clamp01(b) }
+}
+
+function linearOf(c) {
+  return [srgbToLinear(c.r), srgbToLinear(c.g), srgbToLinear(c.b)]
+}
+
+function oklchOf(c) {
+  var v = linearOf(c)
+  var lab = linearToOklab(v[0], v[1], v[2])
+  var h = Math.atan2(lab[2], lab[1]) * 180 / Math.PI
+  return { L: lab[0], C: Math.sqrt(lab[1] * lab[1] + lab[2] * lab[2]), h: (h + 360) % 360 }
+}
+
+// WCAG relative luminance and contrast ratio.
+function luminance(c) {
+  var v = linearOf(c)
+  return 0.2126 * v[0] + 0.7152 * v[1] + 0.0722 * v[2]
+}
+
+function contrastRatio(a, b) {
+  var x = luminance(a)
+  var y = luminance(b)
+  return (Math.max(x, y) + 0.05) / (Math.min(x, y) + 0.05)
+}
+
+function hueDistance(a, b) {
+  var d = Math.abs(a - b) % 360
+  return d > 180 ? 360 - d : d
+}
+
+// Whether hue h lies on the arc arc[0] -> arc[1] (degrees, increasing,
+// inclusive, wrapping at 360), widened by `margin` on both ends.
+function hueInArc(h, arc, margin) {
+  var m = margin || 0
+  var from = ((arc[0] - m) % 360 + 360) % 360
+  var span = ((arc[1] - arc[0]) % 360 + 360) % 360 + 2 * m
+  return ((h - from) % 360 + 360) % 360 <= span
+}
+
+// Dark or light, from the panel background alone: whichever of white and
+// black contrasts more with it (WCAG luminance crossover, about 0.18). Never
+// from the foreground: text equal to the panel, or white text on a light
+// panel, would put the series on the panel's own side and lose contrast.
+function isDarkBackground(bg) {
+  return contrastRatio(bg, { r: 1, g: 1, b: 1 }) >= contrastRatio(bg, { r: 0, g: 0, b: 0 })
+}
+
+// Protanopia and deuteranopia at severity 1 (Machado, Oliveira and Fernandes
+// 2009), on linear sRGB: the simulation the dataviz CVD thresholds assume.
+var CVD_MATRICES = [
+  [[0.152286, 1.052583, -0.204868], [0.114503, 0.786281, 0.099216], [-0.003882, -0.048116, 1.051998]],
+  [[0.367322, 0.860646, -0.227968], [0.280085, 0.672501, 0.047413], [-0.011820, 0.042940, 0.968881]]
+]
+
+// The colour in OKLab as seen with normal vision, then under each CVD matrix.
+function visionLabs(c) {
+  var v = linearOf(c)
+  var out = [linearToOklab(v[0], v[1], v[2])]
+  for (var k = 0; k < CVD_MATRICES.length; k++) {
+    var M = CVD_MATRICES[k]
+    out.push(linearToOklab(clamp01(M[0][0] * v[0] + M[0][1] * v[1] + M[0][2] * v[2]),
+      clamp01(M[1][0] * v[0] + M[1][1] * v[1] + M[1][2] * v[2]),
+      clamp01(M[2][0] * v[0] + M[2][1] * v[1] + M[2][2] * v[2])))
+  }
+  return out
+}
+
+function labDistance(p, q) {
+  var a = p[0] - q[0]
+  var b = p[1] - q[1]
+  var c = p[2] - q[2]
+  return 100 * Math.sqrt(a * a + b * b + c * c)
+}
+
+// OKLab delta E (x100) between two colours: { normal, cvd } where cvd is the
+// worse of protan and deutan.
+function colorDistance(a, b) {
+  var p = visionLabs(a)
+  var q = visionLabs(b)
+  return { normal: labDistance(p[0], q[0]), cvd: Math.min(labDistance(p[1], q[1]), labDistance(p[2], q[2])) }
+}
+
+function inGamut(v) {
+  var e = 1e-7
+  return v[0] >= -e && v[0] <= 1 + e && v[1] >= -e && v[1] <= 1 + e && v[2] >= -e && v[2] <= 1 + e
+}
+
+function oklchToLinear(L, C, h) {
+  var rad = h * Math.PI / 180
+  return oklabToLinear(L, C * Math.cos(rad), C * Math.sin(rad))
+}
+
+// The largest chroma up to `C` that sRGB can show at lightness L and hue h.
+function gamutChroma(L, C, h) {
+  if (inGamut(oklchToLinear(L, C, h))) return C
+  var lo = 0
+  var hi = C
+  for (var i = 0; i < 16; i++) {
+    var mid = (lo + hi) / 2
+    if (inGamut(oklchToLinear(L, mid, h))) lo = mid
+    else hi = mid
+  }
+  return lo
+}
+
+// OKLCH -> { r, g, b } rounded to 8 bits, so every check sees what is drawn.
+function rgbFromOklch(L, C, h) {
+  var v = oklchToLinear(L, C, h)
+  function channel(x) { return Math.round(clamp01(linearToSrgb(clamp01(x))) * 255) / 255 }
+  return { r: channel(v[0]), g: channel(v[1]), b: channel(v[2]) }
+}
+
+// The lightness nearest the background's side of `band` at which a grey
+// still has minContrast against it: the band's usable part starts there.
+function contrastEdge(band, dark, background) {
+  var target = SERIES_COLOR.minContrast
+  var far = dark ? band[1] : band[0]
+  var near = dark ? band[0] : band[1]
+  function ok(L) { return contrastRatio(rgbFromOklch(L, 0, 0), background) >= target }
+  if (ok(near)) return near
+  if (!ok(far)) return far
+  for (var i = 0; i < 20; i++) {
+    var mid = (near + far) / 2
+    if (ok(mid)) far = mid
+    else near = mid
+  }
+  return far
+}
+
+// One candidate: hue h at lightness L, chroma up to `target` as sRGB allows,
+// moved away from the background in 0.005 steps until it has minContrast
+// (past the band only when the band cannot reach it). The walk may go all the
+// way to white (dark) or black (light), which has at least 4.5:1 against any
+// background isDarkBackground sorted to that side, so the floor always holds;
+// what it costs then is chroma. `drawnH` is the 8-bit colour's own hue (null
+// for a grey, which has none).
+function seriesCandidate(L, h, target, dark, background) {
+  var end = dark ? 1 : 0
+  var c = null
+  for (var i = 0; i < 220; i++) {
+    var C = gamutChroma(L, target, h)
+    c = rgbFromOklch(L, C, h)
+    c.L = L
+    c.C = C
+    c.h = h
+    if (contrastRatio(c, background) >= SERIES_COLOR.minContrast || L === end) break
+    L = dark ? Math.min(1, L + 0.005) : Math.max(0, L - 0.005)
+  }
+  var drawn = oklchOf(c)
+  c.drawnH = drawn.C >= SERIES_COLOR.greyChroma ? drawn.h : null
+  c.labs = visionLabs(c)
+  return c
+}
+
+// How well two candidates separate: the worse of normal-vision delta E over
+// its 15 floor and CVD delta E over its 8 target (1 = both just met).
+function separation(x, y) {
+  var n = labDistance(x.labs[0], y.labs[0])
+  var cvd = Math.min(labDistance(x.labs[1], y.labs[1]), labDistance(x.labs[2], y.labs[2]))
+  return Math.min(n / 15, cvd / 8)
+}
+
+// Theme colours ({ r, g, b } 0..1; `background` is the panel's) -> the three
+// series colours { cpu, gpu, battery } as { r, g, b } (8-bit values), plus
+// `dark` (isDarkBackground: the panel background is the dark side). Pure and
+// deterministic; a few thousand colour conversions, run when the theme
+// changes while the panel is open.
+function seriesColors(accent, foreground, background, urgent) {
+  var S = SERIES_COLOR
+  var bg = rgbIn(background, { r: 0, g: 0, b: 0 })
+  var dark = isDarkBackground(bg)
+  var fg = rgbIn(foreground, inkFor(bg))
+  var acc = rgbIn(accent, fg)
+  var urg = rgbIn(urgent, URGENT_FALLBACK)
+  var band = dark ? S.darkBand : S.lightBand
+  // The part of the band with enough contrast, as `slots` lightness levels.
+  var edge = contrastEdge(band, dark, bg)
+  var lo = dark ? edge : band[0]
+  var hi = dark ? band[1] : edge
+  if (lo > hi) lo = hi = edge
+  var levels = []
+  for (var s = 0; s < S.slots; s++) levels.push(lo + (hi - lo) * s / (S.slots - 1))
+
+  var u = oklchOf(urg)
+  var avoid = u.C >= S.greyChroma
+  // A hue a series may wear: outside the red band and, unless urgent is
+  // grey, outside urgent's gap; `margin` widens both.
+  function allowed(hue, margin) {
+    if (hue === null) return true
+    if (hueInArc(hue, S.redBand, margin)) return false
+    return !avoid || hueDistance(hue, u.h) >= S.urgentGap + margin
+  }
+  var a = oklchOf(acc)
+  // A grey accent has no hue to anchor on. One in a forbidden arc (red, or
+  // urgent's gap) is moved to the nearest allowed hue, hueMargin clear of it.
+  var anchor = a.C >= S.greyChroma ? a.h : S.fallbackHue
+  if (!allowed(anchor, 0)) {
+    for (var d = 1; d <= 180; d++) {
+      if (allowed((anchor + d) % 360, S.hueMargin)) { anchor = (anchor + d) % 360; break }
+      if (allowed((anchor - d + 360) % 360, S.hueMargin)) { anchor = (anchor - d + 360) % 360; break }
+    }
+  }
+
+  // CPU: the accent's own lightness and chroma, brought into the usable band
+  // and up to the chroma floor; failing the floor there, the nearest level
+  // that reaches it.
+  var cpuL = Math.max(lo, Math.min(hi, a.L))
+  var cpuC = Math.min(Math.max(a.C, S.chromaFloor), S.chroma)
+  var tries = [cpuL].concat(levels.slice().sort(function(x, y) { return Math.abs(x - cpuL) - Math.abs(y - cpuL) }))
+  var cpu = null
+  for (var t = 0; t < tries.length; t++) {
+    var cand = seriesCandidate(tries[t], anchor, cpuC, dark, bg)
+    if (!cpu) cpu = cand
+    if (cand.C >= S.chromaFloor && allowed(cand.drawnH, 0)) { cpu = cand; break }
+  }
+
+  // GPU and Battery: every hue step at every level, off the forbidden arcs
+  // (as drawn, after 8-bit rounding) and off the CPU's hue; those below the
+  // chroma floor only when too few reach it.
+  var all = []
+  var pool = []
+  for (var l = 0; l < levels.length; l++) {
+    for (var h = 0; h < 360; h += S.hueStep) {
+      var hue = (anchor + h) % 360
+      if (h === 0 || !allowed(hue, 0)) continue
+      var c = seriesCandidate(levels[l], hue, S.chroma, dark, bg)
+      if (!allowed(c.drawnH, 0)) continue
+      all.push(c)
+      if (c.C >= S.chromaFloor) pool.push(c)
+    }
+  }
+  if (pool.length < 2) pool = all
+
+  // The pair that maximises the worst separation of the three colours.
+  var best = null
+  var bestScore = -1
+  var toCpu = pool.map(function(p) { return separation(cpu, p) })
+  for (var i = 0; i < pool.length; i++) {
+    if (toCpu[i] <= bestScore) continue
+    for (var j = 0; j < pool.length; j++) {
+      if (j === i || toCpu[j] <= bestScore) continue
+      var score = Math.min(toCpu[i], toCpu[j], separation(pool[i], pool[j]))
+      if (score > bestScore + 1e-9) {
+        bestScore = score
+        best = [pool[i], pool[j]]
+      }
+    }
+  }
+  function plain(x) { return { r: x.r, g: x.g, b: x.b } }
+  return { cpu: plain(cpu), gpu: plain(best[0]), battery: plain(best[1]), dark: dark }
+}
+
+// Stand-ins for a missing or fully transparent input: urgent a muted red,
+// the foreground whichever of white and black suits the background.
+var URGENT_FALLBACK = { r: 0.65, g: 0.33, b: 0.33 }
+
+function inkFor(bg) {
+  return isDarkBackground(bg) ? { r: 1, g: 1, b: 1 } : { r: 0, g: 0, b: 0 }
+}
+
+// Every colour the chart and its legend draw, as { r, g, b, a }: the one
+// place both take them from, so they cannot drift. Series from seriesColors;
+// the average, Max and AC bands from the foreground; Mixed is the Battery
+// colour at CHART_STYLE.mixedAlpha (0.45, against Battery's 0.95); the
+// threshold is urgent.
+function chartColors(accent, foreground, background, urgent) {
+  var st = CHART_STYLE
+  var s = seriesColors(accent, foreground, background, urgent)
+  var fg = rgbIn(foreground, inkFor(rgbIn(background, { r: 0, g: 0, b: 0 })))
+  var urg = rgbIn(urgent, URGENT_FALLBACK)
+  function alpha(c, a) { return { r: c.r, g: c.g, b: c.b, a: a } }
+  return {
+    average: alpha(fg, st.areaAlpha), averageLine: alpha(fg, st.areaLineAlpha), max: alpha(fg, st.maxAlpha),
+    cpu: alpha(s.cpu, 1), gpu: alpha(s.gpu, st.gpuAlpha), threshold: alpha(urg, 1),
+    battery: alpha(s.battery, st.batteryAlpha), batteryShade: alpha(s.battery, st.batteryShadeAlpha),
+    mixed: alpha(s.battery, st.mixedAlpha), ac: alpha(fg, st.acAlpha), acMeasured: alpha(fg, st.acMeasuredAlpha),
+    unknown: alpha(fg, st.unknownAlpha)
+  }
+}
+
+// The power-source band's colour for a span mode (pointMode).
+var BAND_MODES = ["battery", "mixed", "acMeasured", "ac"]
+
+function bandColor(colors, mode) {
+  var c = colors || {}
+  return BAND_MODES.indexOf(mode) >= 0 && c[mode] ? c[mode] : c.unknown
+}
+
 // --------------------------------------------------------------- geometry
 
 // How the chart draws each series, shared with the legend so the two cannot
-// drift. Widths and dashes are unscaled px (both go through Style.spaceReal).
-// The series differ in pattern and weight, not only in colour, because the
-// theme's accent equals its foreground in some themes: Max is a thin dotted
-// line, CPU a thick solid one, GPU a thick long-dashed one.
+// drift. Widths and dashes are unscaled px (both go through Style.spaceReal);
+// the alphas apply to the colours chartColors derives. Colour is not the only
+// difference: Max is a thin dotted foreground line, CPU a thick solid one, GPU
+// a thick long-dashed one, and the battery band sits under the plot, so the
+// series stay apart for readers who cannot tell the hues apart. CPU, GPU and
+// Battery are opaque: their contrast against the panel is what seriesColors
+// guarantees. batteryShadeAlpha tints battery periods inside the plot.
 var CHART_STYLE = {
   areaAlpha: 0.26, areaLineAlpha: 0.45,
   maxAlpha: 0.9, maxWidth: 1, maxDash: [2, 2],
   cpuWidth: 2,
-  gpuAlpha: 0.75, gpuWidth: 2, gpuDash: [8, 4],
+  gpuAlpha: 1, gpuWidth: 2, gpuDash: [8, 4],
   thresholdDash: [6, 4],
-  batteryAlpha: 0.95, mixedAlpha: 0.45, acAlpha: 0.22, acMeasuredAlpha: 0.65, unknownAlpha: 0.08
+  batteryAlpha: 0.95, batteryShadeAlpha: 0.08, mixedAlpha: 0.45, acAlpha: 0.22, acMeasuredAlpha: 0.65,
+  unknownAlpha: 0.08
 }
 
 // Data space -> pixel primitives for a plot rectangle. The Canvas only strokes

@@ -38,8 +38,12 @@ import "Model.js" as Model
 //     Loader gated on `opened`, so closing the panel drops the listing, the
 //     watch and the text. The tiers are appended in place, which a directory
 //     watch does not see, so the FileView's own watch reports appends and the
-//     history is re-listed and re-read at most once per
-//     Model.HISTORY_THROTTLE_MS, which also bounds chart repaints.
+//     history is re-listed and re-read at most once per the range's
+//     Model.RANGES[].refreshMs (1h: 5 s; 24h and 7d: 60 s, their tiers change
+//     once a minute or less and a full tier takes ~0.3 s to parse), which also
+//     bounds chart repaints. Opening the panel (a new GatedFile) and switching
+//     the range (a new file name, whose restart stops the throttle) both read
+//     at once; the new range's interval applies from that read on.
 //
 // Parse caps sit behind the read caps: current.json is not parsed past
 // Model.CURRENT_MAX_CHARS, and a history tier is parsed from its end, at most
@@ -106,6 +110,24 @@ Panel {
   readonly property color foreground: root.bar ? root.bar.foreground : Commons.Color.foreground
   readonly property color urgent: root.bar ? root.bar.urgent : Commons.Color.urgent
   readonly property color accent: Commons.Color.accent
+  // Every chart and legend colour, derived from the theme in one place
+  // (Model.chartColors): series hues distinct from each other, from urgent
+  // and from red, with contrast against the panel background. The inputs are
+  // Commons.Color's own, which change once per theme switch: the bar's urgent
+  // animates for 420 ms, and reading it would re-derive the colours (and
+  // repaint the chart) on every frame of that with in-between colours.
+  // bar.text and bar.active are what the bar's foreground and urgent are
+  // bound to, so the threshold still matches the over-threshold text once
+  // the bar settles. Only while the panel is open, as `chart`: null (nothing
+  // computed) on every bar whose panel is closed.
+  readonly property var chartColors: root.opened
+    ? Model.chartColors(Commons.Color.accent, Commons.Color.bar.text, Commons.Color.popups.background,
+      Commons.Color.bar.active)
+    : null
+  function chartColor(key) {
+    var c = root.chartColors ? root.chartColors[key] : null
+    return c ? Qt.rgba(c.r, c.g, c.b, c.a) : "transparent"
+  }
   readonly property string fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
 
   // The theme has no "warning" role. Approaching is the bar colour tinted
@@ -210,8 +232,8 @@ Panel {
   }
 
   // The open panel's tier. Its GatedFile watches the file for appends and
-  // reads it at most once per Model.HISTORY_THROTTLE_MS — whatever triggers
-  // the read: an append, or the directory re-listing on every current.json
+  // reads it at most once per the range's refreshMs — whatever triggers the
+  // read: an append, or the directory re-listing on every current.json
   // rewrite.
   Loader {
     id: historyLoader
@@ -222,7 +244,7 @@ Panel {
         name: Model.rangeFor(root.range).file
         maxBytes: Model.HISTORY_MAX_BYTES
         watchContent: true
-        minIntervalMs: Model.HISTORY_THROTTLE_MS
+        minIntervalMs: Model.rangeFor(root.range).refreshMs
         onTextRead: function(content) { root.applyHistory(content) }
         onFailed: function(outcome) { root.applyHistoryFailure(outcome) }
       }
@@ -411,8 +433,7 @@ Panel {
             height: Style.space(200)
             chart: root.chart
             foreground: root.foreground
-            accent: root.accent
-            urgent: root.urgent
+            colors: root.chartColors
             labelBackground: Commons.Color.popups.background
             fontFamily: root.fontFamily
             fontSize: Style.font.caption
@@ -425,11 +446,11 @@ Panel {
             width: parent.width
             spacing: Style.space(12)
 
-            LegendItem { label: "Average"; swatchColor: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, Model.CHART_STYLE.areaAlpha); swatchHeight: 10; outline: true }
-            LegendItem { label: "Max"; swatchColor: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, Model.CHART_STYLE.maxAlpha); swatchHeight: Model.CHART_STYLE.maxWidth; dash: Model.CHART_STYLE.maxDash }
-            LegendItem { label: "CPU"; swatchColor: root.accent; swatchHeight: Model.CHART_STYLE.cpuWidth }
-            LegendItem { label: "GPU"; swatchColor: Qt.rgba(root.accent.r, root.accent.g, root.accent.b, Model.CHART_STYLE.gpuAlpha); swatchHeight: Model.CHART_STYLE.gpuWidth; dash: Model.CHART_STYLE.gpuDash }
-            LegendItem { label: "Threshold"; swatchColor: root.urgent; swatchHeight: 1; dash: Model.CHART_STYLE.thresholdDash }
+            LegendItem { label: "Average"; swatchColor: root.chartColor("average"); swatchHeight: 10; outline: true }
+            LegendItem { label: "Max"; swatchColor: root.chartColor("max"); swatchHeight: Model.CHART_STYLE.maxWidth; dash: Model.CHART_STYLE.maxDash }
+            LegendItem { label: "CPU"; swatchColor: root.chartColor("cpu"); swatchHeight: Model.CHART_STYLE.cpuWidth }
+            LegendItem { label: "GPU"; swatchColor: root.chartColor("gpu"); swatchHeight: Model.CHART_STYLE.gpuWidth; dash: Model.CHART_STYLE.gpuDash }
+            LegendItem { label: "Threshold"; swatchColor: root.chartColor("threshold"); swatchHeight: 1; dash: Model.CHART_STYLE.thresholdDash }
           }
 
           Flow {
@@ -444,12 +465,12 @@ Panel {
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
             }
-            LegendItem { label: "Battery, measured"; swatchColor: Qt.rgba(root.accent.r, root.accent.g, root.accent.b, Model.CHART_STYLE.batteryAlpha); swatchHeight: 5 }
-            LegendItem { label: "AC, estimated"; swatchColor: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, Model.CHART_STYLE.acAlpha); swatchHeight: 5 }
+            LegendItem { label: "Battery, measured"; swatchColor: root.chartColor("battery"); swatchHeight: 5 }
+            LegendItem { label: "AC, estimated"; swatchColor: root.chartColor("ac"); swatchHeight: 5 }
             // Only where the machine measures on AC (RAPL psys); worded as the
             // status line and the "Total is" row word it.
-            LegendItem { visible: Model.showsMeasuredAc(root.chart, root.current); label: Model.PSYS_BAND_LABEL; swatchColor: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, Model.CHART_STYLE.acMeasuredAlpha); swatchHeight: 5 }
-            LegendItem { label: "Mixed"; swatchColor: Qt.rgba(root.accent.r, root.accent.g, root.accent.b, Model.CHART_STYLE.mixedAlpha); swatchHeight: 5 }
+            LegendItem { visible: Model.showsMeasuredAc(root.chart, root.current); label: Model.PSYS_BAND_LABEL; swatchColor: root.chartColor("acMeasured"); swatchHeight: 5 }
+            LegendItem { label: "Mixed"; swatchColor: root.chartColor("mixed"); swatchHeight: 5 }
           }
 
           Text {
@@ -523,7 +544,15 @@ Panel {
             rowSpacing: Style.spacing.labelGap
             opacity: root.stale ? 0.45 : 1
 
-            InfoPair { width: breakdownGrid.cellWidth; label: "CPU limit"; value: root.caps.cpu }
+            // Capped wears the accent, as the GPU's does; a cap that something
+            // other than power-watch undid ("reverted") wears urgent, and
+            // sampleNotes says so. The words say it too.
+            InfoPair {
+              width: breakdownGrid.cellWidth
+              label: "CPU limit"
+              value: root.caps.cpu
+              valueColor: root.caps.cpuReverted ? root.urgent : root.caps.cpuCapped ? root.accent : root.foreground
+            }
             InfoPair {
               width: breakdownGrid.cellWidth
               label: "GPU limit"
